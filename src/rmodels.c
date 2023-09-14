@@ -70,6 +70,9 @@
 #endif
 
 #if defined(SUPPORT_FILEFORMAT_FBX)
+    #include <stdint.h>
+    #include <sys/types.h>
+    #define UFBX_REAL_IS_FLOAT
     #include "external/ufbx.h"
     #include "external/ufbx.c"
 #endif
@@ -4083,6 +4086,356 @@ static Model LoadOBJ(const char *fileName)
 #endif
 
 #if defined(SUPPORT_FILEFORMAT_FBX)
+
+    /***********************************************
+
+    FBX import functionality implemented by
+    * Nathanael Krauße(@tanolino)
+
+    ************************************************/
+
+typedef struct FbxTmpMeshVertex {
+    float position[3];
+    float normal[3];
+    float uv[2];
+    float fVertexIndex;
+} FbxTmpMeshVertex;
+
+typedef struct FbxTmpSkinVertex {
+    uint8_t boneIndex[4];
+    uint8_t boneWeight[4];
+} FbxTmpSkinVertex;
+
+// Returns the amount of Raylib Mesh elements to cover the given mesh list
+static size_t LoadFBXCalculateModelsNeeded(const ufbx_mesh_list meshList)
+{
+    size_t result = 0;
+
+    // Each Material needs one Mesh
+    for (size_t meshId = 0; meshId < meshList.count; ++meshId)
+    {
+        const ufbx_mesh_material_list matList = meshList.data[meshId]->materials;
+        for (size_t matId = 0; matId < matList.count; ++matId)
+        {
+            if (matList.data[matId].num_triangles != 0)
+                ++result;
+        }
+    }
+    return result;
+}
+
+static size_t LoadFBXPartMaterials(Material** outMaterials, const ufbx_material_list inMaterials)
+{
+    const size_t count = inMaterials.count;
+    *outMaterials = RL_CALLOC(count, sizeof(Material));
+    if (!*outMaterials) return 0;
+
+    for (size_t matId = 0l; matId < count; ++matId)
+    {
+        const ufbx_material* inMat = inMaterials.data[matId];
+        Material* outMat = &(*outMaterials)[matId];
+        *outMat = LoadMaterialDefault();
+
+        SetMaterialTexture(outMat, MATERIAL_MAP_DIFFUSE, texture);
+
+        /*
+        switch (inMat->shader_type)
+        {
+        case UFBX_SHADER_UNKNOWN:
+            // Nothing here but us chickens
+            break;
+        case UFBX_SHADER_FBX_LAMBERT:
+            break;
+        case UFBX_SHADER_FBX_PHONG:
+            break;
+        case UFBX_SHADER_OSL_STANDARD_SURFACE:
+            break;
+        case UFBX_SHADER_ARNOLD_STANDARD_SURFACE:
+            break;
+        case UFBX_SHADER_3DS_MAX_PHYSICAL_MATERIAL:
+            break;
+        case UFBX_SHADER_3DS_MAX_PBR_METAL_ROUGH:
+            break;
+        case UFBX_SHADER_3DS_MAX_PBR_SPEC_GLOSS:
+            break;
+        case UFBX_SHADER_GLTF_MATERIAL:
+            break;
+        case UFBX_SHADER_SHADERFX_GRAPH:
+            break;
+        case UFBX_SHADER_BLENDER_PHONG:
+            break;
+        case UFBX_SHADER_WAVEFRONT_MTL:
+            break;
+        }
+        */
+    }
+    return count;
+}
+
+// Returns the Mesh slots used up
+static size_t LoadFBXPartMesh(Mesh* outMesh, int* outMaterial, const ufbx_mesh* inMesh)
+{
+    // Most of this is directly from 
+    // https://github.com/ufbx/ufbx/blob/master/examples/viewer/viewer.c
+    
+    // Count the number of needed parts and temporary buffers
+    size_t resultingParts = 0;
+    size_t maxParts = 0;
+    size_t maxTriangles = 0;
+
+    // We need to render each material of the mesh in a separate part, so let's
+    // count the number of parts and maximum number of triangles needed.
+    for (size_t pi = 0; pi < inMesh->materials.count; pi++) {
+        const ufbx_mesh_material* meshMat = &inMesh->materials.data[pi];
+        if (meshMat->num_triangles != 0)
+        {
+            maxParts += 1;
+            maxTriangles = max(maxTriangles, meshMat->num_triangles);
+        }
+    }
+
+    // Temporary buffers
+    size_t maxNumTriIndices = inMesh->max_face_triangles * 3;
+    uint32_t *triIndices = RL_MALLOC(sizeof(uint32_t) * maxNumTriIndices);
+    FbxTmpMeshVertex *vertices = RL_MALLOC(sizeof(FbxTmpMeshVertex) * maxTriangles * 3);
+    FbxTmpSkinVertex *skinVertices = RL_MALLOC(sizeof(FbxTmpSkinVertex) * maxTriangles * 3);
+    FbxTmpSkinVertex *meshSkinVertices = RL_MALLOC(sizeof(FbxTmpSkinVertex) * inMesh->num_vertices);
+    uint32_t *indices = RL_MALLOC(sizeof(uint32_t) * maxTriangles * 3);
+
+    // In FBX files a single mesh can be instanced by multiple nodes. ufbx handles the connection
+    // in two ways: (1) `ufbx_node.mesh/light/camera/etc` contains pointer to the data "attribute"
+    // that node uses and (2) each element that can be connected to a node contains a list of
+    // `ufbx_node*` instances eg. `ufbx_mesh.instances`.
+
+    // TODO node relationship
+
+    // Create the vertex buffers
+    size_t num_blend_shapes = 0;
+    // ufbx_blend_channel* blend_channels[MAX_BLEND_SHAPES];
+    size_t num_bones = 0;
+    ufbx_skin_deformer* skin = NULL;
+
+    // TODO deformer
+    /*
+    if (in->skin_deformers.count > 0) {
+        vmesh.skinned = true;
+
+        // Having multiple skin deformers attached at once is exceedingly rare so we can just
+        // pick the first one without having to worry too much about it.
+        skin = in->skin_deformers.data[0];
+
+        // NOTE: A proper implementation would split meshes with too many bones to chunks but
+        // for simplicity we're going to just pick the first `MAX_BONES` ones.
+        for (size_t ci = 0; ci < skin->clusters.count; ci++) {
+            ufbx_skin_cluster* cluster = skin->clusters.data[ci];
+            if (num_bones < MAX_BONES) {
+                vmesh->bone_indices[num_bones] = (int32_t)cluster->bone_node->typed_id;
+                vmesh->bone_matrices[num_bones] = ufbx_to_um_mat(cluster->geometry_to_bone);
+                num_bones++;
+            }
+        }
+        vmesh->num_bones = num_bones;
+
+        // Pre-calculate the skinned vertex bones/weights for each vertex as they will probably
+        // be shared by multiple indices.
+        for (size_t vi = 0; vi < in->num_vertices; vi++) {
+            size_t num_weights = 0;
+            float total_weight = 0.0f;
+            float weights[4] = { 0.0f };
+            uint8_t clusters[4] = { 0 };
+
+            // `ufbx_skin_vertex` contains the offset and number of weights that deform the vertex
+            // in a descending weight order so we can pick the first N weights to use and get a
+            // reasonable approximation of the skinning.
+            ufbx_skin_vertex vertex_weights = skin->vertices.data[vi];
+            for (size_t wi = 0; wi < vertex_weights.num_weights; wi++) {
+                if (num_weights >= 4) break;
+                ufbx_skin_weight weight = skin->weights.data[vertex_weights.weight_begin + wi];
+
+                // Since we only support a fixed amount of bones up to `MAX_BONES` and we take the
+                // first N ones we need to ignore weights with too high `cluster_index`.
+                if (weight.cluster_index < MAX_BONES) {
+                    total_weight += (float)weight.weight;
+                    clusters[num_weights] = (uint8_t)weight.cluster_index;
+                    weights[num_weights] = (float)weight.weight;
+                    num_weights++;
+                }
+            }
+
+            // Normalize and quantize the weights to 8 bits. We need to be a bit careful to make
+            // sure the _quantized_ sum is normalized ie. all 8-bit values sum to 255.
+            if (total_weight > 0.0f) {
+                skin_vertex* skin_vert = &mesh_skin_vertices[vi];
+                uint32_t quantized_sum = 0;
+                for (size_t i = 0; i < 4; i++) {
+                    uint8_t quantized_weight = (uint8_t)((float)weights[i] / total_weight * 255.0f);
+                    quantized_sum += quantized_weight;
+                    skin_vert->bone_index[i] = clusters[i];
+                    skin_vert->bone_weight[i] = quantized_weight;
+                }
+                skin_vert->bone_weight[0] += 255 - quantized_sum;
+            }
+        }
+    }
+
+
+    // Fetch blend channels from all attached blend deformers.
+    for (size_t di = 0; di < in->blend_deformers.count; di++) {
+        ufbx_blend_deformer* deformer = in->blend_deformers.data[di];
+        for (size_t ci = 0; ci < deformer->channels.count; ci++) {
+            ufbx_blend_channel* chan = deformer->channels.data[ci];
+            if (chan->keyframes.count == 0) continue;
+            if (num_blend_shapes < MAX_BLEND_SHAPES) {
+                blend_channels[num_blend_shapes] = chan;
+                vmesh->blend_channel_indices[num_blend_shapes] = (int32_t)chan->typed_id;
+                num_blend_shapes++;
+            }
+        }
+    }
+    if (num_blend_shapes > 0) {
+        vmesh->blend_shape_image = pack_blend_channels_to_image(mesh, blend_channels, num_blend_shapes);
+        vmesh->num_blend_shapes = num_blend_shapes;
+    }
+    */
+
+    // Our shader supports only a single material per draw call so we need to split the mesh
+    // into parts by material. `ufbx_mesh_material` contains a handy compact list of faces
+    // that use the material which we use here.
+    for (size_t pi = 0; pi < inMesh->materials.count; pi++) {
+        ufbx_mesh_material* mesh_mat = &inMesh->materials.data[pi];
+        if (mesh_mat->num_triangles == 0) continue;
+
+        Mesh* outMesh = &outMesh[resultingParts];
+        size_t numIndices = 0;
+
+        // First fetch all vertices into a flat non-indexed buffer, we also need to
+        // triangulate the faces
+        for (size_t fi = 0; fi < mesh_mat->num_faces; fi++) {
+            ufbx_face face = inMesh->faces.data[mesh_mat->face_indices.data[fi]];
+            size_t num_tris = ufbx_triangulate_face(triIndices, maxNumTriIndices, inMesh, face);
+
+            ufbx_vec2 default_uv = { 0 };
+
+            // Iterate through every vertex of every triangle in the triangulated result
+            for (size_t vi = 0; vi < num_tris * 3; vi++) {
+                uint32_t ix = triIndices[vi];
+                FbxTmpMeshVertex *vert = &vertices[numIndices];
+
+                ufbx_vec3 pos = ufbx_get_vertex_vec3(&inMesh->vertex_position, ix);
+                ufbx_vec3 normal = ufbx_get_vertex_vec3(&inMesh->vertex_normal, ix);
+                ufbx_vec2 uv = inMesh->vertex_uv.exists ? ufbx_get_vertex_vec2(&inMesh->vertex_uv, ix) : default_uv;
+
+                memcpy(vert->position, pos.v, sizeof(float) * 3);
+                memcpy(vert->normal, normal.v, sizeof(float) * 3);
+                memcpy(vert->uv, uv.v, sizeof(float) * 2);
+                vert->fVertexIndex = (float)inMesh->vertex_indices.data[ix];
+
+                // The skinning vertex stream is pre-calculated above so we just need to
+                // copy the right one by the vertex index.
+                if (skin) {
+                    skinVertices[numIndices] = meshSkinVertices[inMesh->vertex_indices.data[ix]];
+                }
+
+                numIndices++;
+            }
+        }
+
+        ufbx_vertex_stream streams[2];
+        size_t num_streams = 1;
+
+        streams[0].data = vertices;
+        streams[0].vertex_size = sizeof(FbxTmpMeshVertex);
+
+        if (skin) {
+            streams[1].data = skinVertices;
+            streams[1].vertex_size = sizeof(FbxTmpSkinVertex);
+            num_streams = 2;
+        }
+
+        // Optimize the flat vertex buffer into an indexed one. `ufbx_generate_indices()`
+        // compacts the vertex buffer and returns the number of used vertices.
+        ufbx_error error;
+        size_t numVertices = ufbx_generate_indices(streams, num_streams, indices, numIndices, NULL, &error);
+        if (error.type != UFBX_ERROR_NONE) {
+            // Maybe print some text like:
+            // printf("Failed to generate index buffer: %s\n", error.description);
+            continue;
+        }
+
+        // To unify code we use `ufbx_load_opts.allow_null_material` to make ufbx create a
+        // `ufbx_mesh_material` even if there are no materials, so it might be `NULL` here.
+        outMesh->triangleCount = numIndices / 3;
+        if (mesh_mat->material)
+            *outMaterial = (int)mesh_mat->material->typed_id;
+        else
+            *outMaterial = -1;
+
+        // Create the GPU buffers from the temporary `vertices` and `indices` arrays
+        outMesh->indices = RL_MALLOC(sizeof(unsigned short) * numIndices);
+        for (size_t i = 0; i < numIndices; ++i)
+        {
+            const uint32_t index = indices[i];
+            if (index > UINT16_MAX)
+            {
+                // Maybe print some text like:
+                // printf("fbx index overflowing Raylib index buffer");
+            }
+            outMesh->indices[i] = (unsigned short)index;
+        }
+        outMesh->vertexCount = numVertices;
+        if (outMesh->vertices = RL_MALLOC(sizeof(float) * 3 * numVertices))
+        {
+            float *outVert = outMesh->vertices;
+            for (size_t i = 0; i < numVertices; ++i)
+            {
+                memcpy(outVert, vertices[i].position, sizeof(float) * 3);
+                outVert += 3;
+            }
+        }
+
+        if (outMesh->normals = RL_MALLOC(sizeof(float) * 3 * numVertices))
+        {
+            float *outNorm = outMesh->normals;
+            for (size_t i = 0; i < numVertices; ++i)
+            {
+                memcpy(outNorm, vertices[i].normal, sizeof(float) * 3);
+                outNorm += 3;
+            }
+        }
+
+        if (outMesh->texcoords = RL_MALLOC(sizeof(float) * 2 * numVertices))
+        {
+            float *outUV = outMesh->texcoords;
+            for (size_t i = 0; i < numVertices; ++i)
+            {
+                memcpy(outUV, vertices[i].uv, sizeof(float) * 2);
+                outUV += 2;
+            }
+        }
+        /*
+        if (vmesh->skinned) {
+            part->skin_buffer = sg_make_buffer(&(sg_buffer_desc) {
+                .size = numVertices * sizeof(skin_vertex),
+                    .type = SG_BUFFERTYPE_VERTEXBUFFER,
+                    .data = { skin_vertices, numVertices * sizeof(skin_vertex) },
+            });
+        }
+        */
+
+        resultingParts++;
+        outMaterial++;
+    }
+
+    // Free the temporary buffers
+    free(triIndices);
+    free(vertices);
+    free(skinVertices);
+    free(meshSkinVertices);
+    free(indices);
+
+    return resultingParts;
+}
+
 static Model LoadFBX(const char *fileName)
 {
     Model model = { 0 };
@@ -4091,12 +4444,10 @@ static Model LoadFBX(const char *fileName)
     ufbx_load_opts opts = {
 		.load_external_files = false,
 		.allow_null_material = true,
+        .allow_empty_faces = false,
+        .allow_missing_vertex_position = false,
+        .strict = true,
 		.generate_missing_normals = true,
-
-		// NOTE: We use this _only_ for computing the bounds of the scene!
-		// The viewer contains a proper implementation of skinning as well.
-		// You probably don't need this.
-		.evaluate_skinning = true,
 
 		.target_axes = {
 			.right = UFBX_COORDINATE_AXIS_POSITIVE_X,
@@ -4108,18 +4459,32 @@ static Model LoadFBX(const char *fileName)
 	ufbx_error error;
 	ufbx_scene *scene = ufbx_load_file(fileName, &opts, &error);
 	if (!scene) {
-        // TODO
-		// print_error(&error, "Failed to load scene");
+        // Maybe print some text like:
+		// printf("Failed to load scene: %s\n", error.description);
 		return model;
 	}
 
-    for (size_t i = 0; i < scene->nodes.count; ++i) {
-        const ufbx_node *node = scene->nodes.data[i];
-        if (node->is_root) continue;
-
-        
+    const size_t fbxMeshCount = scene->meshes.count;
+    const size_t rayMeshCount = LoadFBXCalculateModelsNeeded(scene->meshes);
+    model.meshCount = rayMeshCount;
+    model.meshes = RL_CALLOC(rayMeshCount, sizeof(Mesh));
+    model.meshMaterial = RL_MALLOC(rayMeshCount, sizeof(int));
+    size_t rayMeshNum = 0;
+    for (size_t fbxMeshNum = 0; fbxMeshNum < fbxMeshCount; ++fbxMeshNum)
+    {
+        rayMeshNum += LoadFBXPartMesh(
+            &model.meshes[rayMeshNum], // we pass the first Mesh to fill
+            &model.meshMaterial[rayMeshNum],
+            scene->meshes.data[fbxMeshNum]);
     }
-    
+    // assert model.meshCount == rayMeshNum otherwise we allocated too much
+    model.meshCount = rayMeshNum;
+    model.materialCount = LoadFBXPartMaterials(&model.materials, scene->materials);
+    if (!model.materialCount)
+    {
+        RL_FREE(model.meshMaterial);
+        model.meshMaterial = 0;
+    }
 
     ufbx_free_scene(scene);
     return model;
