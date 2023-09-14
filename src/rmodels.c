@@ -7,6 +7,7 @@
 *           rmodels module is included in the build
 *
 *       #define SUPPORT_FILEFORMAT_OBJ
+*       #define SUPPORT_FILEFORMAT_FBX
 *       #define SUPPORT_FILEFORMAT_MTL
 *       #define SUPPORT_FILEFORMAT_IQM
 *       #define SUPPORT_FILEFORMAT_GLTF
@@ -66,6 +67,11 @@
 
     #define TINYOBJ_LOADER_C_IMPLEMENTATION
     #include "external/tinyobj_loader_c.h"      // OBJ/MTL file formats loading
+#endif
+
+#if defined(SUPPORT_FILEFORMAT_FBX)
+    #include "external/ufbx.h"
+    #include "external/ufbx.c"
 #endif
 
 #if defined(SUPPORT_FILEFORMAT_GLTF)
@@ -148,6 +154,9 @@
 //----------------------------------------------------------------------------------
 #if defined(SUPPORT_FILEFORMAT_OBJ)
 static Model LoadOBJ(const char *fileName);     // Load OBJ mesh data
+#endif
+#if defined(SUPPORT_FILEFORMAT_FBX)
+static Model LoadFBX(const char *fileName);     // Load FBX mesh data
 #endif
 #if defined(SUPPORT_FILEFORMAT_IQM)
 static Model LoadIQM(const char *fileName);     // Load IQM mesh data
@@ -1035,6 +1044,9 @@ Model LoadModel(const char *fileName)
 
 #if defined(SUPPORT_FILEFORMAT_OBJ)
     if (IsFileExtension(fileName, ".obj")) model = LoadOBJ(fileName);
+#endif
+#if defined(SUPPORT_FILEFORMAT_FBX)
+    if (IsFileExtension(fileName, ".fbx")) model = LoadFBX(fileName);
 #endif
 #if defined(SUPPORT_FILEFORMAT_IQM)
     if (IsFileExtension(fileName, ".iqm")) model = LoadIQM(fileName);
@@ -4066,6 +4078,50 @@ static Model LoadOBJ(const char *fileName)
         }
     }
 
+    return model;
+}
+#endif
+
+#if defined(SUPPORT_FILEFORMAT_FBX)
+static Model LoadFBX(const char *fileName)
+{
+    Model model = { 0 };
+
+    // TODO configure memory allocation with ufbx_allocator
+    ufbx_load_opts opts = {
+		.load_external_files = false,
+		.allow_null_material = true,
+		.generate_missing_normals = true,
+
+		// NOTE: We use this _only_ for computing the bounds of the scene!
+		// The viewer contains a proper implementation of skinning as well.
+		// You probably don't need this.
+		.evaluate_skinning = true,
+
+		.target_axes = {
+			.right = UFBX_COORDINATE_AXIS_POSITIVE_X,
+			.up = UFBX_COORDINATE_AXIS_POSITIVE_Y,
+			.front = UFBX_COORDINATE_AXIS_POSITIVE_Z,
+		},
+		.target_unit_meters = 1.0f,
+	};
+	ufbx_error error;
+	ufbx_scene *scene = ufbx_load_file(fileName, &opts, &error);
+	if (!scene) {
+        // TODO
+		// print_error(&error, "Failed to load scene");
+		return model;
+	}
+
+    for (size_t i = 0; i < scene->nodes.count; ++i) {
+        const ufbx_node *node = scene->nodes.data[i];
+        if (node->is_root) continue;
+
+        
+    }
+    
+
+    ufbx_free_scene(scene);
     return model;
 }
 #endif
