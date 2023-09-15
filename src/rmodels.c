@@ -4094,37 +4094,127 @@ static Model LoadOBJ(const char *fileName)
 
     ************************************************/
 
-typedef struct FbxTmpMeshVertex {
-    float position[3];
-    float normal[3];
-    float uv[2];
-    float fVertexIndex;
-} FbxTmpMeshVertex;
-
-typedef struct FbxTmpSkinVertex {
-    uint8_t boneIndex[4];
-    uint8_t boneWeight[4];
-} FbxTmpSkinVertex;
-
-// Returns the amount of Raylib Mesh elements to cover the given mesh list
-static size_t LoadFBXCalculateModelsNeeded(const ufbx_mesh_list meshList)
+static bool LoadFBXPartTextureToImage(Image *outImage,
+    const ufbx_texture *inTexture,
+    const ufbx_texture_file_list inSceneTextureFiles)
 {
-    size_t result = 0;
-
-    // Each Material needs one Mesh
-    for (size_t meshId = 0; meshId < meshList.count; ++meshId)
+    switch (inTexture->type)
     {
-        const ufbx_mesh_material_list matList = meshList.data[meshId]->materials;
-        for (size_t matId = 0; matId < matList.count; ++matId)
+    case UFBX_TEXTURE_FILE:
+    {
+        ufbx_blob blob;
+        ufbx_string realativeFilename;
+        if (inTexture->file_index != UFBX_NO_INDEX)
         {
-            if (matList.data[matId].num_triangles != 0)
-                ++result;
+            // TODO : FIX This might recreate the same texture in GPU memory for each use
+            const ufbx_texture_file* textureFile = inSceneTextureFiles.data + inTexture->file_index;
+            blob = textureFile->content;
+            realativeFilename = textureFile->relative_filename;
         }
+        else
+        {
+            blob = inTexture->content;
+            realativeFilename = inTexture->relative_filename;
+        }
+
+        if (blob.data)
+        {
+            const char* ext = GetFileExtension(realativeFilename.data);
+            *outImage = LoadImageFromMemory(
+                ext,
+                blob.data,
+                blob.size);
+        }
+        else
+        {
+            *outImage = LoadImage(realativeFilename.data);
+        }
+
+        return IsImageReady(*outImage);
     }
-    return result;
+    break;
+    case UFBX_TEXTURE_LAYERED:
+    {
+        bool first = true;
+        ufbx_texture_layer_list layerList = inTexture->layers;
+        for (size_t i = 0; i < layerList.count; ++i)
+        {
+            Image innerImage;
+            if (LoadFBXPartTextureToImage(&innerImage,
+                layerList.data[i].texture,
+                inSceneTextureFiles))
+            {
+                if (first)
+                {
+                    *outImage = innerImage;
+                    first = false;
+                }
+                else
+                {
+                    // TODO
+                }
+            }
+        }
+        return IsImageReady(*outImage);
+    }
+    break;
+    case UFBX_TEXTURE_PROCEDURAL:
+        // not implemented
+        break;
+    case UFBX_TEXTURE_SHADER:
+        // not implemented
+        break;
+    }
 }
 
-static size_t LoadFBXPartMaterials(Material** outMaterials, const ufbx_material_list inMaterials)
+static bool LoadFBXPartTexture(Texture *outTexture,
+    const ufbx_material_map *inMatMap,
+    const ufbx_texture_file_list inSceneTextureFiles)
+{
+    if (!inMatMap->has_value)
+    {
+        return false;
+    }
+    else if (inMatMap->texture)
+    {
+        Image image = { 0 };
+        if (LoadFBXPartTextureToImage(&image, inMatMap->texture, inSceneTextureFiles))
+        {
+            *outTexture = LoadTextureFromImage(image);
+            return true;
+        }
+    }
+    else // if (inMatMap->value_components)
+    {
+        Color color = { 0 };
+        color.a = 255;
+        switch (inMatMap->value_components)
+        {
+        case 4:
+            color.a = (unsigned char)(inMatMap->value_vec4.v[3] * 255.0f);
+        case 3:
+            color.b = (unsigned char)(inMatMap->value_vec3.v[2] * 255.0f);
+        case 2:
+            color.g = (unsigned char)(inMatMap->value_vec2.v[1] * 255.0f);
+        case 1:
+            color.r = (unsigned char)(inMatMap->value_real * 255.0f);
+            break;
+        default:
+            // We should never end up here
+            return false;
+        }
+
+        const Image image = GenImageColor(2, 2, color);
+        *outTexture = LoadTextureFromImage(image);
+        return true;
+    }
+    return false;
+}
+
+static size_t LoadFBXPartMaterials(
+    Material** outMaterials,
+    const ufbx_material_list inMaterials,
+    const ufbx_texture_file_list inSceneTextureFiles)
 {
     const size_t count = inMaterials.count;
     *outMaterials = RL_CALLOC(count, sizeof(Material));
@@ -4136,8 +4226,25 @@ static size_t LoadFBXPartMaterials(Material** outMaterials, const ufbx_material_
         Material* outMat = &(*outMaterials)[matId];
         *outMat = LoadMaterialDefault();
 
-        SetMaterialTexture(outMat, MATERIAL_MAP_DIFFUSE, texture);
+        // the following criteria is not 100%
+        if (inMat->shader == 0)
+        {
+            // use inMat->fbx
 
+            Texture rayTexture = { 0 };
+            if (LoadFBXPartTexture(&rayTexture,
+                &inMat->fbx.diffuse_color,
+                inSceneTextureFiles))
+            {
+                SetMaterialTexture(outMat, MATERIAL_MAP_DIFFUSE, rayTexture);
+            }
+        }
+        else
+        {
+            // use inMat->pbr
+        }
+
+        // If inMat->shader == 0 is not sufficient, we might need to use this:
         /*
         switch (inMat->shader_type)
         {
@@ -4171,6 +4278,36 @@ static size_t LoadFBXPartMaterials(Material** outMaterials, const ufbx_material_
     }
     return count;
 }
+
+// Returns the amount of Raylib Mesh elements to cover the given mesh list
+static size_t LoadFBXCalculateModelsNeeded(const ufbx_mesh_list meshList)
+{
+    size_t result = 0;
+
+    // Each Material needs one Mesh
+    for (size_t meshId = 0; meshId < meshList.count; ++meshId)
+    {
+        const ufbx_mesh_material_list matList = meshList.data[meshId]->materials;
+        for (size_t matId = 0; matId < matList.count; ++matId)
+        {
+            if (matList.data[matId].num_triangles != 0)
+                ++result;
+        }
+    }
+    return result;
+}
+
+typedef struct FbxTmpMeshVertex {
+    float position[3];
+    float normal[3];
+    float uv[2];
+    float fVertexIndex;
+} FbxTmpMeshVertex;
+
+typedef struct FbxTmpSkinVertex {
+    uint8_t boneIndex[4];
+    uint8_t boneWeight[4];
+} FbxTmpSkinVertex;
 
 // Returns the Mesh slots used up
 static size_t LoadFBXPartMesh(Mesh* outMesh, int* outMaterial, const ufbx_mesh* inMesh)
@@ -4305,7 +4442,6 @@ static size_t LoadFBXPartMesh(Mesh* outMesh, int* outMaterial, const ufbx_mesh* 
         ufbx_mesh_material* mesh_mat = &inMesh->materials.data[pi];
         if (mesh_mat->num_triangles == 0) continue;
 
-        Mesh* outMesh = &outMesh[resultingParts];
         size_t numIndices = 0;
 
         // First fetch all vertices into a flat non-indexed buffer, we also need to
@@ -4422,6 +4558,7 @@ static size_t LoadFBXPartMesh(Mesh* outMesh, int* outMaterial, const ufbx_mesh* 
         }
         */
 
+        outMesh++;
         resultingParts++;
         outMaterial++;
     }
@@ -4468,7 +4605,7 @@ static Model LoadFBX(const char *fileName)
     const size_t rayMeshCount = LoadFBXCalculateModelsNeeded(scene->meshes);
     model.meshCount = rayMeshCount;
     model.meshes = RL_CALLOC(rayMeshCount, sizeof(Mesh));
-    model.meshMaterial = RL_MALLOC(rayMeshCount, sizeof(int));
+    model.meshMaterial = RL_CALLOC(rayMeshCount, sizeof(int));
     size_t rayMeshNum = 0;
     for (size_t fbxMeshNum = 0; fbxMeshNum < fbxMeshCount; ++fbxMeshNum)
     {
@@ -4479,7 +4616,8 @@ static Model LoadFBX(const char *fileName)
     }
     // assert model.meshCount == rayMeshNum otherwise we allocated too much
     model.meshCount = rayMeshNum;
-    model.materialCount = LoadFBXPartMaterials(&model.materials, scene->materials);
+    model.materialCount = LoadFBXPartMaterials(
+        &model.materials, scene->materials, scene->texture_files);
     if (!model.materialCount)
     {
         RL_FREE(model.meshMaterial);
