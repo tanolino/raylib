@@ -4094,6 +4094,53 @@ static Model LoadOBJ(const char *fileName)
 
     ************************************************/
 
+typedef struct FbxTmpMeshToNodeEntry
+{
+    ufbx_mesh* fbxMesh; // one fbxMesh
+    ufbx_matrix* fbxMatrix; // multiple Transformations
+    size_t count;
+} FbxTmpMeshToNodeEntry;
+
+typedef struct FbxTmpMeshToNodeLookup
+{
+    FbxTmpMeshToNodeEntry* entries;
+    size_t count;
+} FbxTmpMeshToNodeLookup;
+
+// This is not suited for any animation related stuff
+FbxTmpMeshToNodeLookup LoadFBXPartNodesLookupList(const ufbx_scene* scene)
+{
+    FbxTmpMeshToNodeLookup result = { 0 };
+    result.entries = RL_CALLOC(scene->meshes.count, sizeof(FbxTmpMeshToNodeEntry));
+    if (result.entries) return;
+    result.count = scene->meshes.count;
+    for (size_t meshId = 0; meshId < scene->meshes.count; ++meshId)
+    {
+        const ufbx_mesh* mesh = scene->meshes.data[meshId];
+        FbxTmpMeshToNodeEntry* current = result.entries + meshId;
+        current->fbxMesh = mesh;
+
+        for (size_t nodeId = 0; nodeId < scene->nodes.count; ++nodeId)
+        {
+            const ufbx_node* node = &scene->nodes.data[nodeId];
+            if (mesh == node->mesh)
+                ++current->count;
+        }
+        current->fbxMatrix = RL_MALLOC(sizeof(ufbx_matrix) * current->count);
+        current->count = 0;
+        if (!current->fbxMatrix) return;
+        for (size_t nodeId = 0; nodeId < scene->nodes.count; ++nodeId)
+        {
+            const ufbx_node* node = &scene->nodes.data[nodeId];
+            if (mesh == node->mesh)
+            {
+                current->fbxMatrix[current->count++] = node->node_to_world;
+            }
+        }
+    }
+    return result;
+}
+
 static bool LoadFBXPartTextureToImage(Image *outImage,
     const ufbx_texture *inTexture,
     const ufbx_texture_file_list inSceneTextureFiles)
@@ -4159,15 +4206,16 @@ static bool LoadFBXPartTextureToImage(Image *outImage,
     }
     break;
     case UFBX_TEXTURE_PROCEDURAL:
-        // not implemented
+        // TODO
         break;
     case UFBX_TEXTURE_SHADER:
-        // not implemented
+        // TODO
         break;
     }
 }
 
-static bool LoadFBXPartTexture(Texture *outTexture,
+static bool LoadFBXPartMaterialComponent(Material *outMat,
+    const MaterialMapIndex outMapIndex,
     const ufbx_material_map *inMatMap,
     const ufbx_texture_file_list inSceneTextureFiles)
 {
@@ -4180,7 +4228,8 @@ static bool LoadFBXPartTexture(Texture *outTexture,
         Image image = { 0 };
         if (LoadFBXPartTextureToImage(&image, inMatMap->texture, inSceneTextureFiles))
         {
-            *outTexture = LoadTextureFromImage(image);
+            const Texture texture = LoadTextureFromImage(image);
+            SetMaterialTexture(outMat, outMapIndex, texture);
             return true;
         }
     }
@@ -4203,9 +4252,7 @@ static bool LoadFBXPartTexture(Texture *outTexture,
             // We should never end up here
             return false;
         }
-
-        const Image image = GenImageColor(2, 2, color);
-        *outTexture = LoadTextureFromImage(image);
+        outMat->maps[outMapIndex].color = color;
         return true;
     }
     return false;
@@ -4227,21 +4274,58 @@ static size_t LoadFBXPartMaterials(
         *outMat = LoadMaterialDefault();
 
         // the following criteria is not 100%
+
+        // Also most map values also have a "factor" which 
+        // we would have to calculate into our local map (TODO)
         if (inMat->shader == 0)
         {
-            // use inMat->fbx
+            LoadFBXPartMaterialComponent(outMat, MATERIAL_MAP_DIFFUSE, // aka MATERIAL_MAP_ALBEDO
+                &inMat->fbx.diffuse_color, inSceneTextureFiles);
 
-            Texture rayTexture = { 0 };
-            if (LoadFBXPartTexture(&rayTexture,
-                &inMat->fbx.diffuse_color,
-                inSceneTextureFiles))
-            {
-                SetMaterialTexture(outMat, MATERIAL_MAP_DIFFUSE, rayTexture);
-            }
+            LoadFBXPartMaterialComponent(outMat, MATERIAL_MAP_SPECULAR, // aka MATERIAL_MAP_METALNESS
+                &inMat->fbx.specular_color, inSceneTextureFiles);
+
+            LoadFBXPartMaterialComponent(outMat, MATERIAL_MAP_NORMAL,
+                &inMat->fbx.normal_map, inSceneTextureFiles);
+
+            // No MATERIAL_MAP_ROUGHNESS
+
+            LoadFBXPartMaterialComponent(outMat, MATERIAL_MAP_OCCLUSION,
+                &inMat->fbx.ambient_color, inSceneTextureFiles);
+
+            LoadFBXPartMaterialComponent(outMat, MATERIAL_MAP_EMISSION,
+                &inMat->fbx.emission_color, inSceneTextureFiles);
+
+            // Which one will it be
+            LoadFBXPartMaterialComponent(outMat, MATERIAL_MAP_HEIGHT,
+                &inMat->fbx.bump, inSceneTextureFiles);
+            LoadFBXPartMaterialComponent(outMat, MATERIAL_MAP_HEIGHT,
+                &inMat->fbx.displacement, inSceneTextureFiles);
         }
         else
         {
-            // use inMat->pbr
+            LoadFBXPartMaterialComponent(outMat, MATERIAL_MAP_DIFFUSE, // aka MATERIAL_MAP_ALBEDO
+                &inMat->pbr.base_color, inSceneTextureFiles);
+
+            LoadFBXPartMaterialComponent(outMat, MATERIAL_MAP_SPECULAR, // aka MATERIAL_MAP_METALNESS
+                &inMat->pbr.specular_color, inSceneTextureFiles);
+            LoadFBXPartMaterialComponent(outMat, MATERIAL_MAP_SPECULAR, // aka MATERIAL_MAP_METALNESS
+                &inMat->pbr.metalness, inSceneTextureFiles);
+
+            LoadFBXPartMaterialComponent(outMat, MATERIAL_MAP_NORMAL,
+                &inMat->pbr.normal_map, inSceneTextureFiles);
+
+            LoadFBXPartMaterialComponent(outMat, MATERIAL_MAP_ROUGHNESS,
+                &inMat->pbr.roughness, inSceneTextureFiles);
+
+            LoadFBXPartMaterialComponent(outMat, MATERIAL_MAP_OCCLUSION,
+                &inMat->pbr.ambient_occlusion, inSceneTextureFiles);
+
+            LoadFBXPartMaterialComponent(outMat, MATERIAL_MAP_EMISSION,
+                &inMat->pbr.emission_color, inSceneTextureFiles);
+
+            LoadFBXPartMaterialComponent(outMat, MATERIAL_MAP_HEIGHT,
+                &inMat->pbr.displacement_map, inSceneTextureFiles);
         }
 
         // If inMat->shader == 0 is not sufficient, we might need to use this:
@@ -4280,19 +4364,32 @@ static size_t LoadFBXPartMaterials(
 }
 
 // Returns the amount of Raylib Mesh elements to cover the given mesh list
-static size_t LoadFBXCalculateModelsNeeded(const ufbx_mesh_list meshList)
+static size_t LoadFBXPartMeshCalculateSpace(
+    const ufbx_mesh_list meshList,
+    const FbxTmpMeshToNodeLookup lookup)
 {
     size_t result = 0;
 
     // Each Material needs one Mesh
     for (size_t meshId = 0; meshId < meshList.count; ++meshId)
     {
-        const ufbx_mesh_material_list matList = meshList.data[meshId]->materials;
+        const ufbx_mesh* mesh = meshList.data[meshId];
+        const ufbx_mesh_material_list matList = mesh->materials;
+        unsigned int materialFactor = 0;
         for (size_t matId = 0; matId < matList.count; ++matId)
         {
-            if (matList.data[matId].num_triangles != 0)
-                ++result;
+            ++materialFactor;
         }
+
+        unsigned int nodeFactor = mesh->instances.count;
+        for (size_t meshId = 0; meshId < lookup.count; ++meshId)
+        {
+            if (mesh == lookup.entries[meshId].fbxMesh)
+            {
+                nodeFactor += lookup.entries[meshId].count;
+            }
+        }
+        result += materialFactor * nodeFactor;
     }
     return result;
 }
@@ -4310,7 +4407,8 @@ typedef struct FbxTmpSkinVertex {
 } FbxTmpSkinVertex;
 
 // Returns the Mesh slots used up
-static size_t LoadFBXPartMesh(Mesh* outMesh, int* outMaterial, const ufbx_mesh* inMesh)
+static size_t LoadFBXPartMesh(Mesh* outMesh, int* outMaterial,
+    const ufbx_mesh* inMesh, const FbxTmpMeshToNodeEntry *lookupEntry)
 {
     // Most of this is directly from 
     // https://github.com/ufbx/ufbx/blob/master/examples/viewer/viewer.c
@@ -4343,8 +4441,6 @@ static size_t LoadFBXPartMesh(Mesh* outMesh, int* outMaterial, const ufbx_mesh* 
     // in two ways: (1) `ufbx_node.mesh/light/camera/etc` contains pointer to the data "attribute"
     // that node uses and (2) each element that can be connected to a node contains a list of
     // `ufbx_node*` instances eg. `ufbx_mesh.instances`.
-
-    // TODO node relationship
 
     // Create the vertex buffers
     size_t num_blend_shapes = 0;
@@ -4456,7 +4552,7 @@ static size_t LoadFBXPartMesh(Mesh* outMesh, int* outMaterial, const ufbx_mesh* 
             for (size_t vi = 0; vi < num_tris * 3; vi++) {
                 uint32_t ix = triIndices[vi];
                 FbxTmpMeshVertex *vert = &vertices[numIndices];
-
+                
                 ufbx_vec3 pos = ufbx_get_vertex_vec3(&inMesh->vertex_position, ix);
                 ufbx_vec3 normal = ufbx_get_vertex_vec3(&inMesh->vertex_normal, ix);
                 ufbx_vec2 uv = inMesh->vertex_uv.exists ? ufbx_get_vertex_vec2(&inMesh->vertex_uv, ix) : default_uv;
@@ -4498,69 +4594,167 @@ static size_t LoadFBXPartMesh(Mesh* outMesh, int* outMaterial, const ufbx_mesh* 
             continue;
         }
 
-        // To unify code we use `ufbx_load_opts.allow_null_material` to make ufbx create a
-        // `ufbx_mesh_material` even if there are no materials, so it might be `NULL` here.
-        outMesh->triangleCount = numIndices / 3;
-        if (mesh_mat->material)
-            *outMaterial = (int)mesh_mat->material->typed_id;
+        if (lookupEntry)
+        {
+            for (size_t lookupId = 0; lookupId < lookupEntry->count; ++lookupId)
+            {
+                const ufbx_matrix* matrix = &lookupEntry->fbxMatrix[lookupId];
+                // To unify code we use `ufbx_load_opts.allow_null_material` to make ufbx create a
+                // `ufbx_mesh_material` even if there are no materials, so it might be `NULL` here.
+                outMesh->triangleCount = numIndices / 3;
+                if (mesh_mat->material)
+                    *outMaterial = (int)mesh_mat->material->typed_id;
+                else
+                    *outMaterial = -1;
+
+                // Create the GPU buffers from the temporary `vertices` and `indices` arrays
+                outMesh->indices = RL_MALLOC(sizeof(unsigned short) * numIndices);
+                for (size_t i = 0; i < numIndices; ++i)
+                {
+                    const uint32_t index = indices[i];
+                    if (index > UINT16_MAX)
+                    {
+                        // Maybe print some text like:
+                        // printf("fbx index overflowing Raylib index buffer");
+                    }
+                    outMesh->indices[i] = (unsigned short)index;
+                }
+                outMesh->vertexCount = numVertices;
+                if (outMesh->vertices = RL_MALLOC(sizeof(float) * 3 * numVertices))
+                {
+                    float* outVert = outMesh->vertices;
+                    for (size_t i = 0; i < numVertices; ++i)
+                    {
+                        ufbx_vec3 fbxVec;
+                        fbxVec.x = vertices[i].position[0];
+                        fbxVec.y = vertices[i].position[1];
+                        fbxVec.z = vertices[i].position[2];
+                        const ufbx_vec3 out = ufbx_transform_position(matrix, fbxVec);
+                        memcpy(outVert, out.v, sizeof(float) * 3);
+                        outVert += 3;
+                    }
+                }
+
+                if (outMesh->normals = RL_MALLOC(sizeof(float) * 3 * numVertices))
+                {
+                    float* outNorm = outMesh->normals;
+                    for (size_t i = 0; i < numVertices; ++i)
+                    {
+                        ufbx_vec3 fbxVec;
+                        fbxVec.x = vertices[i].normal[0];
+                        fbxVec.y = vertices[i].normal[1];
+                        fbxVec.z = vertices[i].normal[2];
+                        const ufbx_vec3 out = ufbx_transform_direction(matrix, fbxVec);
+                        memcpy(outNorm, out.v, sizeof(float) * 3);
+                        outNorm += 3;
+                    }
+                }
+
+                if (outMesh->texcoords = RL_MALLOC(sizeof(float) * 2 * numVertices))
+                {
+                    float* outUV = outMesh->texcoords;
+                    for (size_t i = 0; i < numVertices; ++i)
+                    {
+                        memcpy(outUV, vertices[i].uv, sizeof(float) * 2);
+                        outUV += 2;
+                    }
+                }
+                /*
+                if (vmesh->skinned) {
+                    part->skin_buffer = sg_make_buffer(&(sg_buffer_desc) {
+                        .size = numVertices * sizeof(skin_vertex),
+                            .type = SG_BUFFERTYPE_VERTEXBUFFER,
+                            .data = { skin_vertices, numVertices * sizeof(skin_vertex) },
+                    });
+                }
+                */
+
+                outMesh++;
+                resultingParts++;
+                outMaterial++;
+            }
+        }
         else
-            *outMaterial = -1;
-
-        // Create the GPU buffers from the temporary `vertices` and `indices` arrays
-        outMesh->indices = RL_MALLOC(sizeof(unsigned short) * numIndices);
-        for (size_t i = 0; i < numIndices; ++i)
         {
-            const uint32_t index = indices[i];
-            if (index > UINT16_MAX)
+            
+            for (size_t instId = 0; instId < inMesh->instances.count; ++instId)
             {
-                // Maybe print some text like:
-                // printf("fbx index overflowing Raylib index buffer");
-            }
-            outMesh->indices[i] = (unsigned short)index;
-        }
-        outMesh->vertexCount = numVertices;
-        if (outMesh->vertices = RL_MALLOC(sizeof(float) * 3 * numVertices))
-        {
-            float *outVert = outMesh->vertices;
-            for (size_t i = 0; i < numVertices; ++i)
-            {
-                memcpy(outVert, vertices[i].position, sizeof(float) * 3);
-                outVert += 3;
-            }
-        }
+                const ufbx_matrix* matrix = &inMesh->instances.data[instId]->geometry_to_world;
+                // To unify code we use `ufbx_load_opts.allow_null_material` to make ufbx create a
+                // `ufbx_mesh_material` even if there are no materials, so it might be `NULL` here.
+                outMesh->triangleCount = numIndices / 3;
+                if (mesh_mat->material)
+                    *outMaterial = (int)mesh_mat->material->typed_id;
+                else
+                    *outMaterial = -1;
 
-        if (outMesh->normals = RL_MALLOC(sizeof(float) * 3 * numVertices))
-        {
-            float *outNorm = outMesh->normals;
-            for (size_t i = 0; i < numVertices; ++i)
-            {
-                memcpy(outNorm, vertices[i].normal, sizeof(float) * 3);
-                outNorm += 3;
+                // Create the GPU buffers from the temporary `vertices` and `indices` arrays
+                outMesh->indices = RL_MALLOC(sizeof(unsigned short) * numIndices);
+                for (size_t i = 0; i < numIndices; ++i)
+                {
+                    const uint32_t index = indices[i];
+                    if (index > UINT16_MAX)
+                    {
+                        // Maybe print some text like:
+                        // printf("fbx index overflowing Raylib index buffer");
+                    }
+                    outMesh->indices[i] = (unsigned short)index;
+                }
+                outMesh->vertexCount = numVertices;
+                if (outMesh->vertices = RL_MALLOC(sizeof(float) * 3 * numVertices))
+                {
+                    float* outVert = outMesh->vertices;
+                    for (size_t i = 0; i < numVertices; ++i)
+                    {
+                        ufbx_vec3 fbxVec;
+                        fbxVec.x = vertices[i].position[0];
+                        fbxVec.y = vertices[i].position[1];
+                        fbxVec.z = vertices[i].position[2];
+                        const ufbx_vec3 out = ufbx_transform_position(matrix, fbxVec);
+                        memcpy(outVert, out.v, sizeof(float) * 3);
+                        outVert += 3;
+                    }
+                }
+
+                if (outMesh->normals = RL_MALLOC(sizeof(float) * 3 * numVertices))
+                {
+                    float* outNorm = outMesh->normals;
+                    for (size_t i = 0; i < numVertices; ++i)
+                    {
+                        ufbx_vec3 fbxVec;
+                        fbxVec.x = vertices[i].normal[0];
+                        fbxVec.y = vertices[i].normal[1];
+                        fbxVec.z = vertices[i].normal[2];
+                        const ufbx_vec3 out = ufbx_transform_direction(matrix, fbxVec);
+                        memcpy(outNorm, out.v, sizeof(float) * 3);
+                        outNorm += 3;
+                    }
+                }
+
+                if (outMesh->texcoords = RL_MALLOC(sizeof(float) * 2 * numVertices))
+                {
+                    float* outUV = outMesh->texcoords;
+                    for (size_t i = 0; i < numVertices; ++i)
+                    {
+                        memcpy(outUV, vertices[i].uv, sizeof(float) * 2);
+                        outUV += 2;
+                    }
+                }
+                /*
+                if (vmesh->skinned) {
+                    part->skin_buffer = sg_make_buffer(&(sg_buffer_desc) {
+                        .size = numVertices * sizeof(skin_vertex),
+                            .type = SG_BUFFERTYPE_VERTEXBUFFER,
+                            .data = { skin_vertices, numVertices * sizeof(skin_vertex) },
+                    });
+                }
+                */
+
+                outMesh++;
+                resultingParts++;
+                outMaterial++;
             }
         }
-
-        if (outMesh->texcoords = RL_MALLOC(sizeof(float) * 2 * numVertices))
-        {
-            float *outUV = outMesh->texcoords;
-            for (size_t i = 0; i < numVertices; ++i)
-            {
-                memcpy(outUV, vertices[i].uv, sizeof(float) * 2);
-                outUV += 2;
-            }
-        }
-        /*
-        if (vmesh->skinned) {
-            part->skin_buffer = sg_make_buffer(&(sg_buffer_desc) {
-                .size = numVertices * sizeof(skin_vertex),
-                    .type = SG_BUFFERTYPE_VERTEXBUFFER,
-                    .data = { skin_vertices, numVertices * sizeof(skin_vertex) },
-            });
-        }
-        */
-
-        outMesh++;
-        resultingParts++;
-        outMaterial++;
     }
 
     // Free the temporary buffers
@@ -4573,13 +4767,23 @@ static size_t LoadFBXPartMesh(Mesh* outMesh, int* outMaterial, const ufbx_mesh* 
     return resultingParts;
 }
 
+void LoadFBXPartNodesLookupListFree(FbxTmpMeshToNodeLookup lookup)
+{
+    for (size_t meshId = 0; meshId < lookup.count; ++meshId)
+    {
+        RL_FREE(lookup.entries[meshId].fbxMatrix);
+    }
+    RL_FREE(lookup.entries);
+}
+
 static Model LoadFBX(const char *fileName)
 {
     Model model = { 0 };
 
     // TODO configure memory allocation with ufbx_allocator
+
     ufbx_load_opts opts = {
-		.load_external_files = false,
+		.load_external_files = true,
 		.allow_null_material = true,
         .allow_empty_faces = false,
         .allow_missing_vertex_position = false,
@@ -4601,18 +4805,40 @@ static Model LoadFBX(const char *fileName)
 		return model;
 	}
 
-    const size_t fbxMeshCount = scene->meshes.count;
-    const size_t rayMeshCount = LoadFBXCalculateModelsNeeded(scene->meshes);
+    FbxTmpMeshToNodeLookup lookup = LoadFBXPartNodesLookupList(scene);
+    const size_t rayMeshCount = LoadFBXPartMeshCalculateSpace(scene->meshes, lookup);
     model.meshCount = rayMeshCount;
     model.meshes = RL_CALLOC(rayMeshCount, sizeof(Mesh));
     model.meshMaterial = RL_CALLOC(rayMeshCount, sizeof(int));
+    ufbx_mesh** fbxSourceMap = RL_CALLOC(rayMeshCount, sizeof(ufbx_mesh*));
     size_t rayMeshNum = 0;
-    for (size_t fbxMeshNum = 0; fbxMeshNum < fbxMeshCount; ++fbxMeshNum)
+    const size_t fbxCount = scene->meshes.count;
+    for (size_t fbxMeshNum = 0; fbxMeshNum < fbxCount; ++fbxMeshNum)
     {
-        rayMeshNum += LoadFBXPartMesh(
+        const ufbx_mesh* fbxMesh = scene->meshes.data[fbxMeshNum];
+
+        FbxTmpMeshToNodeEntry *lookupEntry = 0;
+        for (size_t lookupId = 0; lookupId < lookup.count; ++lookupId)
+        {
+            if (fbxMesh == lookup.entries[lookupId].fbxMesh)
+            {
+                lookupEntry = lookup.entries + lookupId;
+                break;
+            }
+        }
+
+        const size_t fbxSameMesh = LoadFBXPartMesh(
             &model.meshes[rayMeshNum], // we pass the first Mesh to fill
-            &model.meshMaterial[rayMeshNum],
-            scene->meshes.data[fbxMeshNum]);
+            &model.meshMaterial[rayMeshNum], // we pass the first Material lookup id to fill
+            fbxMesh, lookupEntry);
+
+        for (int i = 0; i < fbxSameMesh; ++i)
+        {
+            fbxSourceMap[rayMeshNum + i] = fbxMesh;
+        }
+        rayMeshNum += fbxSameMesh;
+        if (rayMeshNum > model.meshCount)
+            printf("We generate too much");
     }
     // assert model.meshCount == rayMeshNum otherwise we allocated too much
     model.meshCount = rayMeshNum;
@@ -4624,9 +4850,11 @@ static Model LoadFBX(const char *fileName)
         model.meshMaterial = 0;
     }
 
+    LoadFBXPartNodesLookupListFree(lookup);
     ufbx_free_scene(scene);
     return model;
 }
+
 #endif
 
 #if defined(SUPPORT_FILEFORMAT_IQM)
