@@ -4235,8 +4235,7 @@ static bool LoadFBXPartMaterialComponent(Material *outMat,
     }
     else // if (inMatMap->value_components)
     {
-        Color color = { 0 };
-        color.a = 255;
+        Color color = { 0, 0, 0, 255 };
         switch (inMatMap->value_components)
         {
         case 4:
@@ -4258,19 +4257,31 @@ static bool LoadFBXPartMaterialComponent(Material *outMat,
     return false;
 }
 
-static size_t LoadFBXPartMaterials(
-    Material** outMaterials,
+// We create n + 1 materials because we have a default material
+static void LoadFBXPartMaterials(
+    Model *model,
     const ufbx_material_list inMaterials,
     const ufbx_texture_file_list inSceneTextureFiles)
 {
     const size_t count = inMaterials.count;
-    *outMaterials = RL_CALLOC(count, sizeof(Material));
-    if (!*outMaterials) return 0;
+    model->materialCount = count + 1;
+    model->materials = RL_CALLOC(count + 1, sizeof(Material));
+    if (!model->materials)
+    {
+        RL_FREE(model->meshMaterial);
+        model->meshMaterial = 0;
+        return;
+    }
 
+    // We insert the default material to the front
+    for (size_t i = 0; i < model->meshCount; ++i)
+        ++model->meshMaterial[i];
+
+    model->materials[0] = LoadMaterialDefault();
     for (size_t matId = 0l; matId < count; ++matId)
     {
         const ufbx_material* inMat = inMaterials.data[matId];
-        Material* outMat = &(*outMaterials)[matId];
+        Material* outMat = model->materials + (matId + 1);
         *outMat = LoadMaterialDefault();
 
         // the following criteria is not 100%
@@ -4360,7 +4371,6 @@ static size_t LoadFBXPartMaterials(
         }
         */
     }
-    return count;
 }
 
 // Returns the amount of Raylib Mesh elements to cover the given mesh list
@@ -4776,13 +4786,34 @@ void LoadFBXPartNodesLookupListFree(FbxTmpMeshToNodeLookup lookup)
     RL_FREE(lookup.entries);
 }
 
+static void *LoadFBXAllocFn(void *_, size_t size)
+{
+    return RL_MALLOC(size);
+}
+
+static void* LoadFBXReallocFn(void *_, void *oldPtr, size_t oldSize, size_t newSize)
+{
+    return RL_REALLOC(oldPtr, newSize);
+}
+
+static void LoadFBXFreeFn(void *_, void *ptr, size_t size)
+{
+    RL_FREE(ptr);
+}
+
 static Model LoadFBX(const char *fileName)
 {
     Model model = { 0 };
 
-    // TODO configure memory allocation with ufbx_allocator
+    ufbx_allocator alloc = {
+        .alloc_fn = LoadFBXAllocFn,
+        .realloc_fn = LoadFBXReallocFn,
+        .free_fn = LoadFBXFreeFn,
+    };
 
     ufbx_load_opts opts = {
+        .temp_allocator = alloc,
+        .result_allocator = alloc,
 		.load_external_files = true,
 		.allow_null_material = true,
         .allow_empty_faces = false,
@@ -4810,7 +4841,6 @@ static Model LoadFBX(const char *fileName)
     model.meshCount = rayMeshCount;
     model.meshes = RL_CALLOC(rayMeshCount, sizeof(Mesh));
     model.meshMaterial = RL_CALLOC(rayMeshCount, sizeof(int));
-    ufbx_mesh** fbxSourceMap = RL_CALLOC(rayMeshCount, sizeof(ufbx_mesh*));
     size_t rayMeshNum = 0;
     const size_t fbxCount = scene->meshes.count;
     for (size_t fbxMeshNum = 0; fbxMeshNum < fbxCount; ++fbxMeshNum)
@@ -4832,23 +4862,17 @@ static Model LoadFBX(const char *fileName)
             &model.meshMaterial[rayMeshNum], // we pass the first Material lookup id to fill
             fbxMesh, lookupEntry);
 
-        for (int i = 0; i < fbxSameMesh; ++i)
-        {
-            fbxSourceMap[rayMeshNum + i] = fbxMesh;
-        }
         rayMeshNum += fbxSameMesh;
         if (rayMeshNum > model.meshCount)
             printf("We generate too much");
     }
     // assert model.meshCount == rayMeshNum otherwise we allocated too much
     model.meshCount = rayMeshNum;
-    model.materialCount = LoadFBXPartMaterials(
-        &model.materials, scene->materials, scene->texture_files);
-    if (!model.materialCount)
-    {
-        RL_FREE(model.meshMaterial);
-        model.meshMaterial = 0;
-    }
+
+    LoadFBXPartMaterials(
+        &model,
+        scene->materials,
+        scene->texture_files) ;
 
     LoadFBXPartNodesLookupListFree(lookup);
     ufbx_free_scene(scene);
