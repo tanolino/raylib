@@ -4444,9 +4444,9 @@ static void LoadFBXPartBones(Model* model, const ufbx_scene *scene)
 }
 
 typedef struct FbxTmpMeshVertex {
-    float position[3];
-    float normal[3];
-    float uv[2];
+    ufbx_vec3 position;
+    ufbx_vec3 normal;
+    ufbx_vec2 uv;
     float fVertexIndex;
 } FbxTmpMeshVertex;
 
@@ -4602,13 +4602,10 @@ static size_t LoadFBXPartMesh(Mesh* outMesh, int* outMaterial,
                 uint32_t ix = triIndices[vi];
                 FbxTmpMeshVertex* vert = &vertices[numIndices];
 
-                ufbx_vec3 pos = ufbx_get_vertex_vec3(&inMesh->vertex_position, ix);
-                ufbx_vec3 normal = ufbx_get_vertex_vec3(&inMesh->vertex_normal, ix);
-                ufbx_vec2 uv = inMesh->vertex_uv.exists ? ufbx_get_vertex_vec2(&inMesh->vertex_uv, ix) : default_uv;
+                vert->position = ufbx_get_vertex_vec3(&inMesh->vertex_position, ix);
+                vert->normal = ufbx_get_vertex_vec3(&inMesh->vertex_normal, ix);
+                vert->uv = inMesh->vertex_uv.exists ? ufbx_get_vertex_vec2(&inMesh->vertex_uv, ix) : default_uv;
 
-                memcpy(vert->position, pos.v, sizeof(float) * 3);
-                memcpy(vert->normal, normal.v, sizeof(float) * 3);
-                memcpy(vert->uv, uv.v, sizeof(float) * 2);
                 vert->fVertexIndex = (float)inMesh->vertex_indices.data[ix];
 
                 // The skinning vertex stream is pre-calculated above so we just need to
@@ -4676,45 +4673,70 @@ static size_t LoadFBXPartMesh(Mesh* outMesh, int* outMaterial,
                 outMesh->indices[i] = (unsigned short)index;
             }
             outMesh->vertexCount = numVertices;
-            if (outMesh->vertices = RL_MALLOC(sizeof(float) * 3 * numVertices))
+            outMesh->vertices = RL_MALLOC(sizeof(float) * 3 * numVertices);
+            outMesh->normals = RL_MALLOC(sizeof(float) * 3 * numVertices);
+            outMesh->texcoords = RL_MALLOC(sizeof(float) * 2 * numVertices);
+            // Only for animation
+            outMesh->animVertices = RL_MALLOC(sizeof(float) * 3 * numVertices);
+            outMesh->animNormals = RL_MALLOC(sizeof(float) * 3 * numVertices);
+            outMesh->boneIds = RL_MALLOC(sizeof(unsigned char) * 4 * numVertices);
+            outMesh->boneWeights = RL_MALLOC(sizeof(float) * 4 * numVertices);
+
+            if (!outMesh->vertices || !outMesh->normals || !outMesh->texcoords
+                || !outMesh->animVertices || !outMesh->animNormals || !outMesh->boneIds || !outMesh->boneWeights
+            )
             {
-                float* outVert = outMesh->vertices;
-                for (size_t i = 0; i < numVertices; ++i)
-                {
-                    ufbx_vec3 fbxVec;
-                    fbxVec.x = vertices[i].position[0];
-                    fbxVec.y = vertices[i].position[1];
-                    fbxVec.z = vertices[i].position[2];
-                    const ufbx_vec3 out = ufbx_transform_position(&matrix, fbxVec);
-                    memcpy(outVert, out.v, sizeof(float) * 3);
-                    outVert += 3;
-                }
+                outMesh->vertexCount = 0;
+                RL_FREE(outMesh->vertices);
+                RL_FREE(outMesh->normals);
+                RL_FREE(outMesh->texcoords);
+                return;
             }
 
-            if (outMesh->normals = RL_MALLOC(sizeof(float) * 3 * numVertices))
+            float* outVert = outMesh->vertices;
+            for (size_t i = 0; i < numVertices; ++i)
             {
-                float* outNorm = outMesh->normals;
-                for (size_t i = 0; i < numVertices; ++i)
-                {
-                    ufbx_vec3 fbxVec;
-                    fbxVec.x = vertices[i].normal[0];
-                    fbxVec.y = vertices[i].normal[1];
-                    fbxVec.z = vertices[i].normal[2];
-                    const ufbx_vec3 out = ufbx_transform_direction(&matrix, fbxVec);
-                    memcpy(outNorm, out.v, sizeof(float) * 3);
-                    outNorm += 3;
-                }
+                const ufbx_vec3 out = ufbx_transform_position(&matrix, vertices[i].position);
+                memcpy(outVert, out.v, sizeof(float) * 3);
+                outVert += 3;
+            }
+            memcpy(outMesh->animVertices, outMesh->vertices, sizeof(float) * 3 * numVertices);
+
+            float* outNorm = outMesh->normals;
+            for (size_t i = 0; i < numVertices; ++i)
+            {
+                const ufbx_vec3 out = ufbx_transform_direction(&matrix, vertices[i].normal);
+                memcpy(outNorm, out.v, sizeof(float) * 3);
+                outNorm += 3;
+            }
+            memcpy(outMesh->animNormals, outMesh->normals, sizeof(float) * 3 * numVertices);
+
+            float* outUV = outMesh->texcoords;
+            for (size_t i = 0; i < numVertices; ++i)
+            {
+                memcpy(outUV, vertices[i].uv.v, sizeof(float) * 2);
+                outUV += 2;
             }
 
-            if (outMesh->texcoords = RL_MALLOC(sizeof(float) * 2 * numVertices))
+            unsigned char* outBoneIds = outMesh->boneIds;
+            for (size_t i = 0; i < numVertices; ++i)
             {
-                float* outUV = outMesh->texcoords;
-                for (size_t i = 0; i < numVertices; ++i)
-                {
-                    memcpy(outUV, vertices[i].uv, sizeof(float) * 2);
-                    outUV += 2;
-                }
+                outBoneIds[0] = (unsigned char)node->typed_id;
+                outBoneIds[1] = 0;
+                outBoneIds[2] = 0;
+                outBoneIds[3] = 0;
+                outBoneIds += 4;
             }
+            float* outBoneWeight = outMesh->boneWeights;
+            for (size_t i = 0; i < numVertices; ++i)
+            {
+                outBoneWeight[0] = 1.0f;
+                outBoneWeight[1] = 0;
+                outBoneWeight[2] = 0;
+                outBoneWeight[3] = 0;
+                outBoneWeight += 4;
+            }
+
             /*
             if (vmesh->skinned) {
                 part->skin_buffer = sg_make_buffer(&(sg_buffer_desc) {
