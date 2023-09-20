@@ -4094,53 +4094,6 @@ static Model LoadOBJ(const char *fileName)
 
     ************************************************/
 
-typedef struct FbxTmpMeshToNodeEntry
-{
-    ufbx_mesh* fbxMesh; // one fbxMesh
-    ufbx_matrix* fbxMatrix; // multiple Transformations
-    size_t count;
-} FbxTmpMeshToNodeEntry;
-
-typedef struct FbxTmpMeshToNodeLookup
-{
-    FbxTmpMeshToNodeEntry* entries;
-    size_t count;
-} FbxTmpMeshToNodeLookup;
-
-// This is not suited for any animation related stuff
-FbxTmpMeshToNodeLookup LoadFBXPartNodesLookupList(const ufbx_scene* scene)
-{
-    FbxTmpMeshToNodeLookup result = { 0 };
-    result.entries = RL_CALLOC(scene->meshes.count, sizeof(FbxTmpMeshToNodeEntry));
-    if (result.entries) return;
-    result.count = scene->meshes.count;
-    for (size_t meshId = 0; meshId < scene->meshes.count; ++meshId)
-    {
-        const ufbx_mesh* mesh = scene->meshes.data[meshId];
-        FbxTmpMeshToNodeEntry* current = result.entries + meshId;
-        current->fbxMesh = mesh;
-
-        for (size_t nodeId = 0; nodeId < scene->nodes.count; ++nodeId)
-        {
-            const ufbx_node* node = &scene->nodes.data[nodeId];
-            if (mesh == node->mesh)
-                ++current->count;
-        }
-        current->fbxMatrix = RL_MALLOC(sizeof(ufbx_matrix) * current->count);
-        current->count = 0;
-        if (!current->fbxMatrix) return;
-        for (size_t nodeId = 0; nodeId < scene->nodes.count; ++nodeId)
-        {
-            const ufbx_node* node = &scene->nodes.data[nodeId];
-            if (mesh == node->mesh)
-            {
-                current->fbxMatrix[current->count++] = node->node_to_world;
-            }
-        }
-    }
-    return result;
-}
-
 static bool LoadFBXPartTextureToImage(Image *outImage,
     const ufbx_texture *inTexture,
     const ufbx_texture_file_list inSceneTextureFiles)
@@ -4263,9 +4216,20 @@ static void LoadFBXPartMaterials(
     const ufbx_material_list inMaterials,
     const ufbx_texture_file_list inSceneTextureFiles)
 {
-    const size_t count = inMaterials.count;
-    model->materialCount = count + 1;
-    model->materials = RL_CALLOC(count + 1, sizeof(Material));
+    const size_t fbxMaterialCount = inMaterials.count;
+
+    size_t addDefaultMaterial = 0l;
+    for (size_t i = 0; i < model->meshCount; ++i)
+    {
+        if (model->meshMaterial[i] == -1)
+        {
+            model->meshMaterial[i] = fbxMaterialCount;
+            addDefaultMaterial = 1l;
+        }
+    }
+
+    model->materialCount = fbxMaterialCount + addDefaultMaterial;
+    model->materials = RL_CALLOC(fbxMaterialCount + addDefaultMaterial, sizeof(Material));
     if (!model->materials)
     {
         RL_FREE(model->meshMaterial);
@@ -4273,15 +4237,13 @@ static void LoadFBXPartMaterials(
         return;
     }
 
-    // We insert the default material to the front
-    for (size_t i = 0; i < model->meshCount; ++i)
-        ++model->meshMaterial[i];
+    if (addDefaultMaterial)
+        model->materials[fbxMaterialCount] = LoadMaterialDefault();
 
-    model->materials[0] = LoadMaterialDefault();
-    for (size_t matId = 0l; matId < count; ++matId)
+    for (size_t matId = 0l; matId < fbxMaterialCount; ++matId)
     {
         const ufbx_material* inMat = inMaterials.data[matId];
-        Material* outMat = model->materials + (matId + 1);
+        Material* outMat = model->materials + matId;
         *outMat = LoadMaterialDefault();
 
         // the following criteria is not 100%
@@ -4374,9 +4336,8 @@ static void LoadFBXPartMaterials(
 }
 
 // Returns the amount of Raylib Mesh elements to cover the given mesh list
-static size_t LoadFBXPartMeshCalculateSpace(
-    const ufbx_mesh_list meshList,
-    const FbxTmpMeshToNodeLookup lookup)
+static void LoadFBXPartMeshAllocateSpace(
+    Model* model, const ufbx_mesh_list meshList)
 {
     size_t result = 0;
 
@@ -4391,17 +4352,95 @@ static size_t LoadFBXPartMeshCalculateSpace(
             ++materialFactor;
         }
 
-        unsigned int nodeFactor = mesh->instances.count;
-        for (size_t meshId = 0; meshId < lookup.count; ++meshId)
-        {
-            if (mesh == lookup.entries[meshId].fbxMesh)
-            {
-                nodeFactor += lookup.entries[meshId].count;
-            }
-        }
+        const unsigned int nodeFactor = mesh->instances.count;
         result += materialFactor * nodeFactor;
     }
+
+    model->meshCount = result;
+    model->meshes = RL_CALLOC(result, sizeof(Mesh));
+    model->meshMaterial = RL_CALLOC(result, sizeof(int));
+}
+
+static bool LoadFBXPartWalkNodeTree(
+    Model* model,
+    const ufbx_node* fbxNode,
+    size_t rayParent,
+    const size_t boneCount)
+{
+    if (model->boneCount >= boneCount)
+        return false; // We failed with our tree memory requirement
+
+    const size_t rayBoneId = model->boneCount++;
+    memcpy(model->bones[rayBoneId].name,
+        fbxNode->element.name.data,
+        min(fbxNode->element.name.length + 1, 31));
+    model->bones[rayBoneId].parent = rayParent;
+
+    const ufbx_vec3 t = fbxNode->local_transform.translation;
+    const ufbx_vec3 s = fbxNode->local_transform.scale;
+    const ufbx_quat r = fbxNode->local_transform.rotation;
+    model->bindPose[rayBoneId] = (Transform){
+        .translation = (Vector3){ t.x, t.y, t.z },
+        .scale = (Vector3){ s.x, s.y, s.z },
+        .rotation = (Quaternion){ r.x, r.y, r.z, r.w }
+    };
+
+    bool result = true;
+    for (size_t j = 0; j < fbxNode->children.count; ++j)
+    {
+        const ufbx_node *child = fbxNode->children.data[j];
+        result &= LoadFBXPartWalkNodeTree(
+            model, child, rayBoneId, boneCount);
+    }
     return result;
+}
+
+static void LoadFBXPartBones(Model* model, const ufbx_scene *scene)
+{
+    model->boneCount = 0;
+    if (
+        // scene->anim_stacks.count == 0 || // We don't need bones without animation
+        !scene->root_node || // No nodes no animation
+        scene->nodes.count > 255 || // Raylib limitation of 255 Bones
+        false)
+        return;
+
+    const size_t boneCount = scene->nodes.count;
+    model->bones = RL_CALLOC(boneCount, sizeof(BoneInfo));
+    model->bindPose = RL_CALLOC(boneCount, sizeof(Transform));
+
+    if (!LoadFBXPartWalkNodeTree(model, scene->root_node, -1 /*parent*/, boneCount) ||
+        !model->bones || !model->bindPose)
+    {
+        // Failed to load tree or alloc memory
+        model->boneCount = 0;
+        RL_FREE(model->bones);
+        model->bones = 0;
+        RL_FREE(model->bindPose);
+        model->bindPose = 0;
+        return;
+    }
+
+    for (size_t bone = 0; bone < boneCount; ++bone)
+    {
+        // destination
+        BoneInfo *info = model->bones + bone;
+        Transform *pose = model->bindPose + bone;
+
+        // source
+        const ufbx_node *fbxNode = scene->nodes.data[bone];
+
+        // tasks
+        memcpy(info->name, fbxNode->name.data, min(fbxNode->name.length + 1, 31));
+        info->parent = (fbxNode->parent) ? fbxNode->parent->typed_id : -1;
+
+        const ufbx_vec3 t = fbxNode->local_transform.translation;
+        const ufbx_vec3 s = fbxNode->local_transform.scale;
+        const ufbx_quat r = fbxNode->local_transform.rotation;
+        pose->translation = (Vector3){ t.x, t.y, t.z };
+        pose->scale = (Vector3){ s.x, s.y, s.z };
+        pose->rotation = (Quaternion){ r.x, r.y, r.z, r.w };
+    }
 }
 
 typedef struct FbxTmpMeshVertex {
@@ -4418,7 +4457,7 @@ typedef struct FbxTmpSkinVertex {
 
 // Returns the Mesh slots used up
 static size_t LoadFBXPartMesh(Mesh* outMesh, int* outMaterial,
-    const ufbx_mesh* inMesh, const FbxTmpMeshToNodeEntry *lookupEntry)
+    const ufbx_mesh* inMesh, const ufbx_scene *scene)
 {
     // Most of this is directly from 
     // https://github.com/ufbx/ufbx/blob/master/examples/viewer/viewer.c
@@ -4561,8 +4600,8 @@ static size_t LoadFBXPartMesh(Mesh* outMesh, int* outMaterial,
             // Iterate through every vertex of every triangle in the triangulated result
             for (size_t vi = 0; vi < num_tris * 3; vi++) {
                 uint32_t ix = triIndices[vi];
-                FbxTmpMeshVertex *vert = &vertices[numIndices];
-                
+                FbxTmpMeshVertex* vert = &vertices[numIndices];
+
                 ufbx_vec3 pos = ufbx_get_vertex_vec3(&inMesh->vertex_position, ix);
                 ufbx_vec3 normal = ufbx_get_vertex_vec3(&inMesh->vertex_normal, ix);
                 ufbx_vec2 uv = inMesh->vertex_uv.exists ? ufbx_get_vertex_vec2(&inMesh->vertex_uv, ix) : default_uv;
@@ -4604,166 +4643,91 @@ static size_t LoadFBXPartMesh(Mesh* outMesh, int* outMaterial,
             continue;
         }
 
-        if (lookupEntry)
+        for (size_t instId = 0; instId < inMesh->instances.count; ++instId)
         {
-            for (size_t lookupId = 0; lookupId < lookupEntry->count; ++lookupId)
+            const ufbx_node* node = inMesh->instances.data[instId];
+            ufbx_node* tmpNode = node;
+            ufbx_matrix tmpMat = node->geometry_to_node;
+            tmpMat = ufbx_matrix_mul(&tmpNode->node_to_parent, &tmpMat);
+
+            while (tmpNode->parent != 0)
             {
-                const ufbx_matrix* matrix = &lookupEntry->fbxMatrix[lookupId];
-                // To unify code we use `ufbx_load_opts.allow_null_material` to make ufbx create a
-                // `ufbx_mesh_material` even if there are no materials, so it might be `NULL` here.
-                outMesh->triangleCount = numIndices / 3;
-                if (mesh_mat->material)
-                    *outMaterial = (int)mesh_mat->material->typed_id;
-                else
-                    *outMaterial = -1;
-
-                // Create the GPU buffers from the temporary `vertices` and `indices` arrays
-                outMesh->indices = RL_MALLOC(sizeof(unsigned short) * numIndices);
-                for (size_t i = 0; i < numIndices; ++i)
-                {
-                    const uint32_t index = indices[i];
-                    if (index > UINT16_MAX)
-                    {
-                        // Maybe print some text like:
-                        // printf("fbx index overflowing Raylib index buffer");
-                    }
-                    outMesh->indices[i] = (unsigned short)index;
-                }
-                outMesh->vertexCount = numVertices;
-                if (outMesh->vertices = RL_MALLOC(sizeof(float) * 3 * numVertices))
-                {
-                    float* outVert = outMesh->vertices;
-                    for (size_t i = 0; i < numVertices; ++i)
-                    {
-                        ufbx_vec3 fbxVec;
-                        fbxVec.x = vertices[i].position[0];
-                        fbxVec.y = vertices[i].position[1];
-                        fbxVec.z = vertices[i].position[2];
-                        const ufbx_vec3 out = ufbx_transform_position(matrix, fbxVec);
-                        memcpy(outVert, out.v, sizeof(float) * 3);
-                        outVert += 3;
-                    }
-                }
-
-                if (outMesh->normals = RL_MALLOC(sizeof(float) * 3 * numVertices))
-                {
-                    float* outNorm = outMesh->normals;
-                    for (size_t i = 0; i < numVertices; ++i)
-                    {
-                        ufbx_vec3 fbxVec;
-                        fbxVec.x = vertices[i].normal[0];
-                        fbxVec.y = vertices[i].normal[1];
-                        fbxVec.z = vertices[i].normal[2];
-                        const ufbx_vec3 out = ufbx_transform_direction(matrix, fbxVec);
-                        memcpy(outNorm, out.v, sizeof(float) * 3);
-                        outNorm += 3;
-                    }
-                }
-
-                if (outMesh->texcoords = RL_MALLOC(sizeof(float) * 2 * numVertices))
-                {
-                    float* outUV = outMesh->texcoords;
-                    for (size_t i = 0; i < numVertices; ++i)
-                    {
-                        memcpy(outUV, vertices[i].uv, sizeof(float) * 2);
-                        outUV += 2;
-                    }
-                }
-                /*
-                if (vmesh->skinned) {
-                    part->skin_buffer = sg_make_buffer(&(sg_buffer_desc) {
-                        .size = numVertices * sizeof(skin_vertex),
-                            .type = SG_BUFFERTYPE_VERTEXBUFFER,
-                            .data = { skin_vertices, numVertices * sizeof(skin_vertex) },
-                    });
-                }
-                */
-
-                outMesh++;
-                resultingParts++;
-                outMaterial++;
+                tmpNode = tmpNode->parent;
+                tmpMat = ufbx_matrix_mul(&tmpNode->node_to_parent, &tmpMat);
             }
-        }
-        else
-        {
-            
-            for (size_t instId = 0; instId < inMesh->instances.count; ++instId)
+            const ufbx_matrix matrix = tmpMat;
+            //const ufbx_matrix matrix = ufbx_transform_to_matrix(&inMesh->instances.data[instId]->geometry_transform);
+
+            // To unify code we use `ufbx_load_opts.allow_null_material` to make ufbx create a
+            // `ufbx_mesh_material` even if there are no materials, so it might be `NULL` here.
+            outMesh->triangleCount = numIndices / 3;
+            *outMaterial = (mesh_mat->material) ? (int)mesh_mat->material->typed_id : -1;
+
+            // Create the GPU buffers from the temporary `vertices` and `indices` arrays
+            outMesh->indices = RL_MALLOC(sizeof(unsigned short) * numIndices);
+            for (size_t i = 0; i < numIndices; ++i)
             {
-                const ufbx_matrix* matrix = &inMesh->instances.data[instId]->geometry_to_world;
-                // To unify code we use `ufbx_load_opts.allow_null_material` to make ufbx create a
-                // `ufbx_mesh_material` even if there are no materials, so it might be `NULL` here.
-                outMesh->triangleCount = numIndices / 3;
-                if (mesh_mat->material)
-                    *outMaterial = (int)mesh_mat->material->typed_id;
-                else
-                    *outMaterial = -1;
-
-                // Create the GPU buffers from the temporary `vertices` and `indices` arrays
-                outMesh->indices = RL_MALLOC(sizeof(unsigned short) * numIndices);
-                for (size_t i = 0; i < numIndices; ++i)
+                const uint32_t index = indices[i];
+                if (index > UINT16_MAX)
                 {
-                    const uint32_t index = indices[i];
-                    if (index > UINT16_MAX)
-                    {
-                        // Maybe print some text like:
-                        // printf("fbx index overflowing Raylib index buffer");
-                    }
-                    outMesh->indices[i] = (unsigned short)index;
+                    // Maybe print some text like:
+                    // printf("fbx index overflowing Raylib index buffer");
                 }
-                outMesh->vertexCount = numVertices;
-                if (outMesh->vertices = RL_MALLOC(sizeof(float) * 3 * numVertices))
-                {
-                    float* outVert = outMesh->vertices;
-                    for (size_t i = 0; i < numVertices; ++i)
-                    {
-                        ufbx_vec3 fbxVec;
-                        fbxVec.x = vertices[i].position[0];
-                        fbxVec.y = vertices[i].position[1];
-                        fbxVec.z = vertices[i].position[2];
-                        const ufbx_vec3 out = ufbx_transform_position(matrix, fbxVec);
-                        memcpy(outVert, out.v, sizeof(float) * 3);
-                        outVert += 3;
-                    }
-                }
-
-                if (outMesh->normals = RL_MALLOC(sizeof(float) * 3 * numVertices))
-                {
-                    float* outNorm = outMesh->normals;
-                    for (size_t i = 0; i < numVertices; ++i)
-                    {
-                        ufbx_vec3 fbxVec;
-                        fbxVec.x = vertices[i].normal[0];
-                        fbxVec.y = vertices[i].normal[1];
-                        fbxVec.z = vertices[i].normal[2];
-                        const ufbx_vec3 out = ufbx_transform_direction(matrix, fbxVec);
-                        memcpy(outNorm, out.v, sizeof(float) * 3);
-                        outNorm += 3;
-                    }
-                }
-
-                if (outMesh->texcoords = RL_MALLOC(sizeof(float) * 2 * numVertices))
-                {
-                    float* outUV = outMesh->texcoords;
-                    for (size_t i = 0; i < numVertices; ++i)
-                    {
-                        memcpy(outUV, vertices[i].uv, sizeof(float) * 2);
-                        outUV += 2;
-                    }
-                }
-                /*
-                if (vmesh->skinned) {
-                    part->skin_buffer = sg_make_buffer(&(sg_buffer_desc) {
-                        .size = numVertices * sizeof(skin_vertex),
-                            .type = SG_BUFFERTYPE_VERTEXBUFFER,
-                            .data = { skin_vertices, numVertices * sizeof(skin_vertex) },
-                    });
-                }
-                */
-
-                outMesh++;
-                resultingParts++;
-                outMaterial++;
+                outMesh->indices[i] = (unsigned short)index;
             }
+            outMesh->vertexCount = numVertices;
+            if (outMesh->vertices = RL_MALLOC(sizeof(float) * 3 * numVertices))
+            {
+                float* outVert = outMesh->vertices;
+                for (size_t i = 0; i < numVertices; ++i)
+                {
+                    ufbx_vec3 fbxVec;
+                    fbxVec.x = vertices[i].position[0];
+                    fbxVec.y = vertices[i].position[1];
+                    fbxVec.z = vertices[i].position[2];
+                    const ufbx_vec3 out = ufbx_transform_position(&matrix, fbxVec);
+                    memcpy(outVert, out.v, sizeof(float) * 3);
+                    outVert += 3;
+                }
+            }
+
+            if (outMesh->normals = RL_MALLOC(sizeof(float) * 3 * numVertices))
+            {
+                float* outNorm = outMesh->normals;
+                for (size_t i = 0; i < numVertices; ++i)
+                {
+                    ufbx_vec3 fbxVec;
+                    fbxVec.x = vertices[i].normal[0];
+                    fbxVec.y = vertices[i].normal[1];
+                    fbxVec.z = vertices[i].normal[2];
+                    const ufbx_vec3 out = ufbx_transform_direction(&matrix, fbxVec);
+                    memcpy(outNorm, out.v, sizeof(float) * 3);
+                    outNorm += 3;
+                }
+            }
+
+            if (outMesh->texcoords = RL_MALLOC(sizeof(float) * 2 * numVertices))
+            {
+                float* outUV = outMesh->texcoords;
+                for (size_t i = 0; i < numVertices; ++i)
+                {
+                    memcpy(outUV, vertices[i].uv, sizeof(float) * 2);
+                    outUV += 2;
+                }
+            }
+            /*
+            if (vmesh->skinned) {
+                part->skin_buffer = sg_make_buffer(&(sg_buffer_desc) {
+                    .size = numVertices * sizeof(skin_vertex),
+                        .type = SG_BUFFERTYPE_VERTEXBUFFER,
+                        .data = { skin_vertices, numVertices * sizeof(skin_vertex) },
+                });
+            }
+            */
+
+            outMesh++;
+            resultingParts++;
+            outMaterial++;
         }
     }
 
@@ -4775,15 +4739,6 @@ static size_t LoadFBXPartMesh(Mesh* outMesh, int* outMaterial,
     free(indices);
 
     return resultingParts;
-}
-
-void LoadFBXPartNodesLookupListFree(FbxTmpMeshToNodeLookup lookup)
-{
-    for (size_t meshId = 0; meshId < lookup.count; ++meshId)
-    {
-        RL_FREE(lookup.entries[meshId].fbxMatrix);
-    }
-    RL_FREE(lookup.entries);
 }
 
 static void *LoadFBXAllocFn(void *_, size_t size)
@@ -4836,31 +4791,18 @@ static Model LoadFBX(const char *fileName)
 		return model;
 	}
 
-    FbxTmpMeshToNodeLookup lookup = LoadFBXPartNodesLookupList(scene);
-    const size_t rayMeshCount = LoadFBXPartMeshCalculateSpace(scene->meshes, lookup);
-    model.meshCount = rayMeshCount;
-    model.meshes = RL_CALLOC(rayMeshCount, sizeof(Mesh));
-    model.meshMaterial = RL_CALLOC(rayMeshCount, sizeof(int));
+    LoadFBXPartMeshAllocateSpace(&model, scene->meshes);
+    LoadFBXPartBones(&model, scene);
+
     size_t rayMeshNum = 0;
     const size_t fbxCount = scene->meshes.count;
     for (size_t fbxMeshNum = 0; fbxMeshNum < fbxCount; ++fbxMeshNum)
     {
         const ufbx_mesh* fbxMesh = scene->meshes.data[fbxMeshNum];
-
-        FbxTmpMeshToNodeEntry *lookupEntry = 0;
-        for (size_t lookupId = 0; lookupId < lookup.count; ++lookupId)
-        {
-            if (fbxMesh == lookup.entries[lookupId].fbxMesh)
-            {
-                lookupEntry = lookup.entries + lookupId;
-                break;
-            }
-        }
-
         const size_t fbxSameMesh = LoadFBXPartMesh(
             &model.meshes[rayMeshNum], // we pass the first Mesh to fill
             &model.meshMaterial[rayMeshNum], // we pass the first Material lookup id to fill
-            fbxMesh, lookupEntry);
+            fbxMesh, scene);
 
         rayMeshNum += fbxSameMesh;
         if (rayMeshNum > model.meshCount)
@@ -4872,9 +4814,8 @@ static Model LoadFBX(const char *fileName)
     LoadFBXPartMaterials(
         &model,
         scene->materials,
-        scene->texture_files) ;
+        scene->texture_files);
 
-    LoadFBXPartNodesLookupListFree(lookup);
     ufbx_free_scene(scene);
     return model;
 }
