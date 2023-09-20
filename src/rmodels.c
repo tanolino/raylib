@@ -160,6 +160,7 @@ static Model LoadOBJ(const char *fileName);     // Load OBJ mesh data
 #endif
 #if defined(SUPPORT_FILEFORMAT_FBX)
 static Model LoadFBX(const char *fileName);     // Load FBX mesh data
+static ModelAnimation *LoadModelAnimationsFBX(const char* fileName, int* animCount); // Load FBX Animations
 #endif
 #if defined(SUPPORT_FILEFORMAT_IQM)
 static Model LoadIQM(const char *fileName);     // Load IQM mesh data
@@ -2008,6 +2009,10 @@ ModelAnimation *LoadModelAnimations(const char *fileName, int *animCount)
     if (IsFileExtension(fileName, ".gltf;.glb")) animations = LoadModelAnimationsGLTF(fileName, animCount);
 #endif
 
+#if defined(SUPPORT_FILEFORMAT_FBX)
+    if (IsFileExtension(fileName, ".fbx")) animations = LoadModelAnimationsFBX(fileName,  animCount);
+#endif
+
     return animations;
 }
 
@@ -2035,7 +2040,7 @@ void UpdateModelAnimation(Model model, ModelAnimation anim, int frame)
 
             Vector3 inTranslation = { 0 };
             Quaternion inRotation = { 0 };
-            // Vector3 inScale = { 0 };
+            Vector3 inScale = { 0 };
 
             Vector3 outTranslation = { 0 };
             Quaternion outRotation = { 0 };
@@ -2071,16 +2076,21 @@ void UpdateModelAnimation(Model model, ModelAnimation anim, int frame)
                     //int boneIdParent = model.bones[boneId].parent;
                     inTranslation = model.bindPose[boneId].translation;
                     inRotation = model.bindPose[boneId].rotation;
-                    //inScale = model.bindPose[boneId].scale;
+                    inScale = model.bindPose[boneId].scale;
                     outTranslation = anim.framePoses[frame][boneId].translation;
                     outRotation = anim.framePoses[frame][boneId].rotation;
                     outScale = anim.framePoses[frame][boneId].scale;
+                    const Vector3 scale = {
+                        outScale.x / inScale.x,
+                        outScale.y / inScale.y,
+                        outScale.z / inScale.z
+                    };
 
                     // Vertices processing
                     // NOTE: We use meshes.vertices (default vertex position) to calculate meshes.animVertices (animated vertex position)
                     animVertex = (Vector3){ mesh.vertices[vCounter], mesh.vertices[vCounter + 1], mesh.vertices[vCounter + 2] };
                     animVertex = Vector3Subtract(animVertex, inTranslation);
-                    animVertex = Vector3Multiply(animVertex, outScale);
+                    animVertex = Vector3Multiply(animVertex, scale);
                     animVertex = Vector3RotateByQuaternion(animVertex, QuaternionMultiply(outRotation, QuaternionInvert(inRotation)));
                     animVertex = Vector3Add(animVertex, outTranslation);
                     //animVertex = Vector3Transform(animVertex, model.transform);
@@ -4091,6 +4101,8 @@ static Model LoadOBJ(const char *fileName)
 
     FBX import functionality implemented by
     * Nathanael Krauße(@tanolino)
+    
+    based on ufbx, see: https://github.com/ufbx/ufbx
 
     ************************************************/
 
@@ -4361,6 +4373,17 @@ static void LoadFBXPartMeshAllocateSpace(
     model->meshMaterial = RL_CALLOC(result, sizeof(int));
 }
 
+static void LoadFBXPartImportTransform(
+    Transform *rayTransform, const ufbx_transform *fbxTransf)
+{
+    const ufbx_vec3 t = fbxTransf->translation;
+    const ufbx_vec3 s = fbxTransf->scale;
+    const ufbx_quat r = fbxTransf->rotation;
+    rayTransform->translation = (Vector3){ t.x, t.y, t.z };
+    rayTransform->scale = (Vector3){ s.x, s.y, s.z };
+    rayTransform->rotation = (Quaternion){ r.x, r.y, r.z, r.w };
+}
+
 static bool LoadFBXPartWalkNodeTree(
     Model* model,
     const ufbx_node* fbxNode,
@@ -4376,14 +4399,7 @@ static bool LoadFBXPartWalkNodeTree(
         min(fbxNode->element.name.length + 1, 31));
     model->bones[rayBoneId].parent = rayParent;
 
-    const ufbx_vec3 t = fbxNode->local_transform.translation;
-    const ufbx_vec3 s = fbxNode->local_transform.scale;
-    const ufbx_quat r = fbxNode->local_transform.rotation;
-    model->bindPose[rayBoneId] = (Transform){
-        .translation = (Vector3){ t.x, t.y, t.z },
-        .scale = (Vector3){ s.x, s.y, s.z },
-        .rotation = (Quaternion){ r.x, r.y, r.z, r.w }
-    };
+    LoadFBXPartImportTransform(model->bindPose + rayBoneId, &fbxNode->local_transform);
 
     bool result = true;
     for (size_t j = 0; j < fbxNode->children.count; ++j)
@@ -4434,12 +4450,7 @@ static void LoadFBXPartBones(Model* model, const ufbx_scene *scene)
         memcpy(info->name, fbxNode->name.data, min(fbxNode->name.length + 1, 31));
         info->parent = (fbxNode->parent) ? fbxNode->parent->typed_id : -1;
 
-        const ufbx_vec3 t = fbxNode->local_transform.translation;
-        const ufbx_vec3 s = fbxNode->local_transform.scale;
-        const ufbx_quat r = fbxNode->local_transform.rotation;
-        pose->translation = (Vector3){ t.x, t.y, t.z };
-        pose->scale = (Vector3){ s.x, s.y, s.z };
-        pose->rotation = (Quaternion){ r.x, r.y, r.z, r.w };
+        LoadFBXPartImportTransform(pose, &fbxNode->local_transform);
     }
 }
 
@@ -4452,7 +4463,7 @@ typedef struct FbxTmpMeshVertex {
 
 typedef struct FbxTmpSkinVertex {
     uint8_t boneIndex[4];
-    uint8_t boneWeight[4];
+    float boneWeight[4]; // 1.0f means full, but the 4 weights will be normalized
 } FbxTmpSkinVertex;
 
 // Returns the Mesh slots used up
@@ -4482,9 +4493,10 @@ static size_t LoadFBXPartMesh(Mesh* outMesh, int* outMaterial,
     size_t maxNumTriIndices = inMesh->max_face_triangles * 3;
     uint32_t *triIndices = RL_MALLOC(sizeof(uint32_t) * maxNumTriIndices);
     FbxTmpMeshVertex *vertices = RL_MALLOC(sizeof(FbxTmpMeshVertex) * maxTriangles * 3);
-    FbxTmpSkinVertex *skinVertices = RL_MALLOC(sizeof(FbxTmpSkinVertex) * maxTriangles * 3);
-    FbxTmpSkinVertex *meshSkinVertices = RL_MALLOC(sizeof(FbxTmpSkinVertex) * inMesh->num_vertices);
     uint32_t *indices = RL_MALLOC(sizeof(uint32_t) * maxTriangles * 3);
+
+    FbxTmpSkinVertex* skinVertices = RL_CALLOC(maxTriangles * 3, sizeof(FbxTmpSkinVertex));
+    FbxTmpSkinVertex* meshSkinVertices = RL_CALLOC(inMesh->num_vertices, sizeof(FbxTmpSkinVertex));
 
     // In FBX files a single mesh can be instanced by multiple nodes. ufbx handles the connection
     // in two ways: (1) `ufbx_node.mesh/light/camera/etc` contains pointer to the data "attribute"
@@ -4497,70 +4509,51 @@ static size_t LoadFBXPartMesh(Mesh* outMesh, int* outMaterial,
     size_t num_bones = 0;
     ufbx_skin_deformer* skin = NULL;
 
-    // TODO deformer
-    /*
-    if (in->skin_deformers.count > 0) {
-        vmesh.skinned = true;
+    // We will only use one deformer
+    if (inMesh->skin_deformers.count > 0) {
 
         // Having multiple skin deformers attached at once is exceedingly rare so we can just
         // pick the first one without having to worry too much about it.
-        skin = in->skin_deformers.data[0];
-
-        // NOTE: A proper implementation would split meshes with too many bones to chunks but
-        // for simplicity we're going to just pick the first `MAX_BONES` ones.
-        for (size_t ci = 0; ci < skin->clusters.count; ci++) {
-            ufbx_skin_cluster* cluster = skin->clusters.data[ci];
-            if (num_bones < MAX_BONES) {
-                vmesh->bone_indices[num_bones] = (int32_t)cluster->bone_node->typed_id;
-                vmesh->bone_matrices[num_bones] = ufbx_to_um_mat(cluster->geometry_to_bone);
-                num_bones++;
-            }
-        }
-        vmesh->num_bones = num_bones;
+        skin = inMesh->skin_deformers.data[0];
 
         // Pre-calculate the skinned vertex bones/weights for each vertex as they will probably
         // be shared by multiple indices.
-        for (size_t vi = 0; vi < in->num_vertices; vi++) {
-            size_t num_weights = 0;
-            float total_weight = 0.0f;
-            float weights[4] = { 0.0f };
-            uint8_t clusters[4] = { 0 };
-
+        for (size_t vi = 0; vi < inMesh->num_vertices; vi++) {
             // `ufbx_skin_vertex` contains the offset and number of weights that deform the vertex
             // in a descending weight order so we can pick the first N weights to use and get a
             // reasonable approximation of the skinning.
-            ufbx_skin_vertex vertex_weights = skin->vertices.data[vi];
-            for (size_t wi = 0; wi < vertex_weights.num_weights; wi++) {
-                if (num_weights >= 4) break;
-                ufbx_skin_weight weight = skin->weights.data[vertex_weights.weight_begin + wi];
+            ufbx_skin_vertex vertexWeights = skin->vertices.data[vi];
+            const size_t alignStart = vi * 4;
+            float weightSum = 0.0f;
+            FbxTmpSkinVertex* skinVert = &meshSkinVertices[vi];
+            for (size_t wi = 0; wi < 4; wi++) { // 4 is max limit
+                if (wi < vertexWeights.num_weights)
+                {
+                    ufbx_skin_weight weight = skin->weights.data[vertexWeights.weight_begin + wi];
 
-                // Since we only support a fixed amount of bones up to `MAX_BONES` and we take the
-                // first N ones we need to ignore weights with too high `cluster_index`.
-                if (weight.cluster_index < MAX_BONES) {
-                    total_weight += (float)weight.weight;
-                    clusters[num_weights] = (uint8_t)weight.cluster_index;
-                    weights[num_weights] = (float)weight.weight;
-                    num_weights++;
+                    // Since we only support a fixed amount of bones up to `MAX_BONES` and we take the
+                    // first N ones we need to ignore weights with too high `cluster_index`.
+                    if (weight.cluster_index < UINT8_MAX) {
+                        skinVert->boneIndex[wi] = (uint8_t)weight.cluster_index;
+                        skinVert->boneWeight[wi] = weight.weight;
+                        weightSum += weight.weight;
+                    }
                 }
-            }
-
-            // Normalize and quantize the weights to 8 bits. We need to be a bit careful to make
-            // sure the _quantized_ sum is normalized ie. all 8-bit values sum to 255.
-            if (total_weight > 0.0f) {
-                skin_vertex* skin_vert = &mesh_skin_vertices[vi];
-                uint32_t quantized_sum = 0;
-                for (size_t i = 0; i < 4; i++) {
-                    uint8_t quantized_weight = (uint8_t)((float)weights[i] / total_weight * 255.0f);
-                    quantized_sum += quantized_weight;
-                    skin_vert->bone_index[i] = clusters[i];
-                    skin_vert->bone_weight[i] = quantized_weight;
+                else
+                {
+                    skinVert->boneIndex[wi] = 0;
+                    skinVert->boneWeight[wi] = 0.0f;
                 }
-                skin_vert->bone_weight[0] += 255 - quantized_sum;
             }
         }
+
+        // For further weight processing we need the current node as fallback bone
+        // because the Mesh itself is part of a node structure
     }
 
 
+    // TODO blend deformer
+    /*
     // Fetch blend channels from all attached blend deformers.
     for (size_t di = 0; di < in->blend_deformers.count; di++) {
         ufbx_blend_deformer* deformer = in->blend_deformers.data[di];
@@ -4673,14 +4666,15 @@ static size_t LoadFBXPartMesh(Mesh* outMesh, int* outMaterial,
                 outMesh->indices[i] = (unsigned short)index;
             }
             outMesh->vertexCount = numVertices;
-            outMesh->vertices = RL_MALLOC(sizeof(float) * 3 * numVertices);
-            outMesh->normals = RL_MALLOC(sizeof(float) * 3 * numVertices);
-            outMesh->texcoords = RL_MALLOC(sizeof(float) * 2 * numVertices);
+            const size_t floatSizeAndVert = sizeof(float) * numVertices;
+            outMesh->vertices = RL_MALLOC(floatSizeAndVert * 3);
+            outMesh->normals = RL_MALLOC(floatSizeAndVert * 3);
+            outMesh->texcoords = RL_MALLOC(floatSizeAndVert * 2);
             // Only for animation
-            outMesh->animVertices = RL_MALLOC(sizeof(float) * 3 * numVertices);
-            outMesh->animNormals = RL_MALLOC(sizeof(float) * 3 * numVertices);
-            outMesh->boneIds = RL_MALLOC(sizeof(unsigned char) * 4 * numVertices);
-            outMesh->boneWeights = RL_MALLOC(sizeof(float) * 4 * numVertices);
+            outMesh->animVertices = RL_MALLOC(floatSizeAndVert * 3);
+            outMesh->animNormals = RL_MALLOC(floatSizeAndVert * 3);
+            outMesh->boneIds = RL_CALLOC(4 * numVertices, sizeof(unsigned char));
+            outMesh->boneWeights = RL_MALLOC(sizeof(float) * 4 * numVertices); // Don't CALLOC float
 
             if (!outMesh->vertices || !outMesh->normals || !outMesh->texcoords
                 || !outMesh->animVertices || !outMesh->animNormals || !outMesh->boneIds || !outMesh->boneWeights
@@ -4718,34 +4712,56 @@ static size_t LoadFBXPartMesh(Mesh* outMesh, int* outMaterial,
                 outUV += 2;
             }
 
+            // BONES
             unsigned char* outBoneIds = outMesh->boneIds;
-            for (size_t i = 0; i < numVertices; ++i)
-            {
-                outBoneIds[0] = (unsigned char)node->typed_id;
-                outBoneIds[1] = 0;
-                outBoneIds[2] = 0;
-                outBoneIds[3] = 0;
-                outBoneIds += 4;
-            }
             float* outBoneWeight = outMesh->boneWeights;
             for (size_t i = 0; i < numVertices; ++i)
             {
-                outBoneWeight[0] = 1.0f;
-                outBoneWeight[1] = 0;
-                outBoneWeight[2] = 0;
-                outBoneWeight[3] = 0;
+                const FbxTmpSkinVertex *skinVert = skinVertices + i;
+                const float boneWeightSum = skinVert->boneWeight[0]
+                    + skinVert->boneWeight[1]
+                    + skinVert->boneWeight[2]
+                    + skinVert->boneWeight[3];
+
+                // Work through the corner cases
+                if (boneWeightSum <= 0.0f) {
+                    outBoneIds[0] = (unsigned char)node->typed_id;
+                    // outBoneIds 1 2 3 auto 0 through calloc
+                    outBoneWeight[0] = 1.0f;
+                    outBoneWeight[1] = 0.0f;
+                    outBoneWeight[2] = 0.0f;
+                    outBoneWeight[3] = 0.0f;
+                }
+                else
+                {
+                    memcpy(outBoneIds, skinVert->boneIndex, sizeof(uint8_t) * 4);
+                    memcpy(outBoneWeight, skinVert->boneWeight, sizeof(float) * 4);
+
+                    /*
+                    if (boneWeightSum < 1.0f)
+                    {
+                        // We can not fully pass on responsibility to bones,
+                        // the parent node still needs a slot
+
+                        outBoneIds[3] = (unsigned char)node->typed_id;
+                        outBoneWeight[3] = 1.0f - 
+                            (outBoneWeight[0] + outBoneWeight[1] + outBoneWeight[2]);
+                    }
+                    else if (boneWeightSum > 1.0f) 
+                    */
+                    {
+                        // try to normalize
+                        outBoneWeight[0] /= boneWeightSum;
+                        outBoneWeight[1] /= boneWeightSum;
+                        outBoneWeight[2] /= boneWeightSum;
+                        outBoneWeight[3] /= boneWeightSum;
+                    }
+                }
+
+                outBoneIds += 4;
                 outBoneWeight += 4;
             }
-
-            /*
-            if (vmesh->skinned) {
-                part->skin_buffer = sg_make_buffer(&(sg_buffer_desc) {
-                    .size = numVertices * sizeof(skin_vertex),
-                        .type = SG_BUFFERTYPE_VERTEXBUFFER,
-                        .data = { skin_vertices, numVertices * sizeof(skin_vertex) },
-                });
-            }
-            */
+            // END OF BONES
 
             outMesh++;
             resultingParts++;
@@ -4778,10 +4794,8 @@ static void LoadFBXFreeFn(void *_, void *ptr, size_t size)
     RL_FREE(ptr);
 }
 
-static Model LoadFBX(const char *fileName)
+static ufbx_scene *LoadFBXCommonLoad(const char* fileName)
 {
-    Model model = { 0 };
-
     ufbx_allocator alloc = {
         .alloc_fn = LoadFBXAllocFn,
         .realloc_fn = LoadFBXReallocFn,
@@ -4791,27 +4805,37 @@ static Model LoadFBX(const char *fileName)
     ufbx_load_opts opts = {
         .temp_allocator = alloc,
         .result_allocator = alloc,
-		.load_external_files = true,
-		.allow_null_material = true,
+        .load_external_files = true,
+        .allow_null_material = true,
         .allow_empty_faces = false,
         .allow_missing_vertex_position = false,
         .strict = true,
-		.generate_missing_normals = true,
+        .generate_missing_normals = true,
 
-		.target_axes = {
-			.right = UFBX_COORDINATE_AXIS_POSITIVE_X,
-			.up = UFBX_COORDINATE_AXIS_POSITIVE_Y,
-			.front = UFBX_COORDINATE_AXIS_POSITIVE_Z,
-		},
-		.target_unit_meters = 1.0f,
-	};
-	ufbx_error error;
-	ufbx_scene *scene = ufbx_load_file(fileName, &opts, &error);
-	if (!scene) {
+        .target_axes = {
+            .right = UFBX_COORDINATE_AXIS_POSITIVE_X,
+            .up = UFBX_COORDINATE_AXIS_POSITIVE_Y,
+            .front = UFBX_COORDINATE_AXIS_POSITIVE_Z,
+        },
+        .target_unit_meters = 1.0f,
+    };
+    ufbx_error error;
+    return ufbx_load_file(fileName, &opts, &error);
+    /*
+    if (!scene) {
         // Maybe print some text like:
-		// printf("Failed to load scene: %s\n", error.description);
-		return model;
-	}
+        // printf("Failed to load scene: %s\n", error.description);
+        return model;
+    }
+    */
+}
+
+static Model LoadFBX(const char *fileName)
+{
+    Model model = { 0 };
+
+    const ufbx_scene *scene = LoadFBXCommonLoad(fileName);
+    if (!scene) return model;
 
     LoadFBXPartMeshAllocateSpace(&model, scene->meshes);
     LoadFBXPartBones(&model, scene);
@@ -4840,6 +4864,66 @@ static Model LoadFBX(const char *fileName)
 
     ufbx_free_scene(scene);
     return model;
+}
+
+static ModelAnimation *LoadModelAnimationsFBX(const char* fileName, int* animCount) // Load FBX Animations
+{
+    ModelAnimation *rayAnimationsOutput = 0;
+    *animCount = 0;
+
+    const ufbx_scene *scene = LoadFBXCommonLoad(fileName);
+    if (!scene || // Failed to load FBX
+        scene->anim_stacks.count == 0 || // We have no animations in the file
+        !scene->root_node || // FBX should provide a root_node, I think
+        scene->nodes.count > 255 // Raylib limitation of 255 Bones
+        ) return rayAnimationsOutput;
+
+    *animCount = scene->anim_stacks.count;
+    rayAnimationsOutput = RL_CALLOC(scene->anim_stacks.count, sizeof(ModelAnimation));
+
+    const float targetFramerate = 30.0f;
+    const float frameTime = 1.0f / targetFramerate;
+    const size_t boneCount = scene->nodes.count;
+
+    for (size_t animNr = 0; animNr < scene->anim_stacks.count; ++animNr)
+    {
+        ModelAnimation* rayAnim = rayAnimationsOutput + animNr;
+        ufbx_anim_stack *fbxAnimStack = scene->anim_stacks.data[animNr];
+
+        double runtime = max(fbxAnimStack->time_end - fbxAnimStack->time_begin, 0.0);
+        rayAnim->boneCount = boneCount;
+        rayAnim->bones = RL_CALLOC(boneCount, sizeof(BoneInfo));
+        for (size_t bone = 0; bone < boneCount; ++bone)
+        {
+            const ufbx_node* fbxNode = scene->nodes.data[bone];
+            BoneInfo *info = rayAnim->bones + bone;
+            memcpy(info->name, fbxNode->name.data, min(fbxNode->name.length + 1, 31));
+            info->parent = (fbxNode->parent) ? fbxNode->parent->typed_id : -1;
+        }
+        rayAnim->frameCount = runtime <= 0.0 ? 1 : (runtime / frameTime) + 1;
+        rayAnim->framePoses = RL_CALLOC(rayAnim->frameCount, sizeof(Transform));
+        // TODO Check "Out of Memory" here
+
+        for (size_t keyFrameNr = 0; keyFrameNr < rayAnim->frameCount; ++keyFrameNr)
+        {
+            double time = fbxAnimStack->time_begin +
+                (double)keyFrameNr * runtime / (double)rayAnim->frameCount;
+            rayAnim->framePoses[keyFrameNr] = RL_MALLOC(sizeof(Transform) * boneCount);
+            // TODO Check "Out of Memory" here
+
+            for (size_t bone = 0; bone < boneCount; ++bone)
+            {
+                const ufbx_node* fbxNode = scene->nodes.data[bone];
+
+                ufbx_transform transform = ufbx_evaluate_transform(&fbxAnimStack->anim, fbxNode, time);
+                LoadFBXPartImportTransform(
+                    &rayAnim->framePoses[keyFrameNr][bone],
+                    &transform);
+            }
+        }
+    }
+
+    return rayAnimationsOutput;
 }
 
 #endif
