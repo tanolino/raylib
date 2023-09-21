@@ -3589,11 +3589,13 @@ unsigned char *CompressData(const unsigned char *data, int dataSize, int *compDa
 
 #if defined(SUPPORT_COMPRESSION_API)
     // Compress data and generate a valid DEFLATE stream
-    struct sdefl sdefl = { 0 };
-    int bounds = sdefl_bound(dataSize);
+    struct sdefl *sdefl = RL_CALLOC(1, sizeof(struct sdefl));   // WARNING: Possible stack overflow, struct sdefl is almost 1MB
+    int bounds = dataSize*2;//sdefl_bound(dataSize);
     compData = (unsigned char *)RL_CALLOC(bounds, 1);
-    *compDataSize = sdeflate(&sdefl, compData, data, dataSize, COMPRESSION_QUALITY_DEFLATE);   // Compression level 8, same as stbiw
-
+    
+    *compDataSize = sdeflate(sdefl, compData, data, dataSize, COMPRESSION_QUALITY_DEFLATE);   // Compression level 8, same as stbiw
+    RL_FREE(sdefl);
+    
     TRACELOG(LOG_INFO, "SYSTEM: Compress data: Original size: %i -> Comp. size: %i", dataSize, *compDataSize);
 #endif
 
@@ -6966,10 +6968,10 @@ static void *EventThread(void *arg)
 
             // Update touch point count
             CORE.Input.Touch.pointCount = 0;
-            if (CORE.Input.Touch.position[0].x >= 0) CORE.Input.Touch.pointCount++;
-            if (CORE.Input.Touch.position[1].x >= 0) CORE.Input.Touch.pointCount++;
-            if (CORE.Input.Touch.position[2].x >= 0) CORE.Input.Touch.pointCount++;
-            if (CORE.Input.Touch.position[3].x >= 0) CORE.Input.Touch.pointCount++;
+            for (int i = 0; i < MAX_TOUCH_POINTS; i++)
+            {
+                if (CORE.Input.Touch.position[i].x >= 0) CORE.Input.Touch.pointCount++;
+            }
 
 #if defined(SUPPORT_GESTURES_SYSTEM)        // PLATFORM_DRM
             if (gestureUpdate)
@@ -6979,15 +6981,11 @@ static void *EventThread(void *arg)
                 gestureEvent.touchAction = touchAction;
                 gestureEvent.pointCount = CORE.Input.Touch.pointCount;
 
-                gestureEvent.pointId[0] = 0;
-                gestureEvent.pointId[1] = 1;
-                gestureEvent.pointId[2] = 2;
-                gestureEvent.pointId[3] = 3;
-
-                gestureEvent.position[0] = CORE.Input.Touch.position[0];
-                gestureEvent.position[1] = CORE.Input.Touch.position[1];
-                gestureEvent.position[2] = CORE.Input.Touch.position[2];
-                gestureEvent.position[3] = CORE.Input.Touch.position[3];
+                for (int i = 0; i < MAX_TOUCH_POINTS; i++)
+                {
+                    gestureEvent.pointId[i] = i;
+                    gestureEvent.position[i] = CORE.Input.Touch.position[i];
+                }
 
                 ProcessGestureEvent(gestureEvent);
             }

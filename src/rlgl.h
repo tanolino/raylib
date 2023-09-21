@@ -2997,7 +2997,10 @@ unsigned int rlLoadTexture(const void *data, int width, int height, int format, 
 
     int mipWidth = width;
     int mipHeight = height;
-    int mipOffset = 0;          // Mipmap data offset
+    int mipOffset = 0;          // Mipmap data offset, only used for tracelog
+    
+    // NOTE: Added pointer math separately from function to avoid UBSAN complaining
+    unsigned char *dataPtr = (unsigned char *)data;
 
     // Load the different mipmap levels
     for (int i = 0; i < mipmapCount; i++)
@@ -3011,9 +3014,9 @@ unsigned int rlLoadTexture(const void *data, int width, int height, int format, 
 
         if (glInternalFormat != -1)
         {
-            if (format < RL_PIXELFORMAT_COMPRESSED_DXT1_RGB) glTexImage2D(GL_TEXTURE_2D, i, glInternalFormat, mipWidth, mipHeight, 0, glFormat, glType, (unsigned char *)data + mipOffset);
+            if (format < RL_PIXELFORMAT_COMPRESSED_DXT1_RGB) glTexImage2D(GL_TEXTURE_2D, i, glInternalFormat, mipWidth, mipHeight, 0, glFormat, glType, dataPtr);
 #if !defined(GRAPHICS_API_OPENGL_11)
-            else glCompressedTexImage2D(GL_TEXTURE_2D, i, glInternalFormat, mipWidth, mipHeight, 0, mipSize, (unsigned char *)data + mipOffset);
+            else glCompressedTexImage2D(GL_TEXTURE_2D, i, glInternalFormat, mipWidth, mipHeight, 0, mipSize, dataPtr);
 #endif
 
 #if defined(GRAPHICS_API_OPENGL_33)
@@ -3036,7 +3039,8 @@ unsigned int rlLoadTexture(const void *data, int width, int height, int format, 
 
         mipWidth /= 2;
         mipHeight /= 2;
-        mipOffset += mipSize;
+        mipOffset += mipSize;       // Increment offset position to next mipmap
+        dataPtr += mipSize;         // Increment data pointer to next mipmap
 
         // Security check for NPOT textures
         if (mipWidth < 1) mipWidth = 1;
@@ -3399,7 +3403,7 @@ void *rlReadTexturePixels(unsigned int id, int width, int height, int format)
 
     // Attach our texture to FBO
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, id, 0);
-
+    
     // We read data as RGBA because FBO texture is configured as RGBA, despite binding another texture format
     pixels = (unsigned char *)RL_MALLOC(rlGetPixelDataSize(width, height, RL_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8));
     glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
@@ -3537,11 +3541,14 @@ bool rlFramebufferComplete(unsigned int id)
 void rlUnloadFramebuffer(unsigned int id)
 {
 #if (defined(GRAPHICS_API_OPENGL_33) || defined(GRAPHICS_API_OPENGL_ES2)) && defined(RLGL_RENDER_TEXTURES_HINT)
-
     // Query depth attachment to automatically delete texture/renderbuffer
     int depthType = 0, depthId = 0;
     glBindFramebuffer(GL_FRAMEBUFFER, id);   // Bind framebuffer to query depth texture type
     glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &depthType);
+
+    // TODO: Review warning retrieving object name in WebGL
+    // WARNING: WebGL: INVALID_ENUM: getFramebufferAttachmentParameter: invalid parameter name
+    // https://registry.khronos.org/webgl/specs/latest/1.0/
     glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &depthId);
 
     unsigned int depthIdU = (unsigned int)depthId;
