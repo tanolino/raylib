@@ -4598,6 +4598,16 @@ static size_t LoadFBXPartMesh(Mesh* outMesh, int* outMaterial,
                 vert->position = ufbx_get_vertex_vec3(&inMesh->vertex_position, ix);
                 vert->normal = ufbx_get_vertex_vec3(&inMesh->vertex_normal, ix);
                 vert->uv = inMesh->vertex_uv.exists ? ufbx_get_vertex_vec2(&inMesh->vertex_uv, ix) : default_uv;
+                if (inMesh->vertex_tangent.exists && inMesh->vertex_bitangent.exists)
+                {
+                    const ufbx_vec2 tangent = ufbx_get_vertex_vec2(&inMesh->vertex_tangent, ix); // x
+                    const ufbx_vec2 bitangent = ufbx_get_vertex_vec2(&inMesh->vertex_tangent, ix); // y
+                    const float x = vert->uv.x * tangent.x + vert->uv.y * bitangent.x;
+                    const float y = vert->uv.x * tangent.y + vert->uv.y * bitangent.y;
+                    vert->uv.x = x;
+                    vert->uv.y = y;
+                }
+                vert->uv.y = 1.0f - vert->uv.y;
 
                 vert->fVertexIndex = (float)inMesh->vertex_indices.data[ix];
 
@@ -4625,8 +4635,9 @@ static size_t LoadFBXPartMesh(Mesh* outMesh, int* outMaterial,
 
         // Optimize the flat vertex buffer into an indexed one. `ufbx_generate_indices()`
         // compacts the vertex buffer and returns the number of used vertices.
-        ufbx_error error;
+        ufbx_error error = { .type = UFBX_ERROR_NONE };
         size_t numVertices = ufbx_generate_indices(streams, num_streams, indices, numIndices, NULL, &error);
+        //size_t numVertices = numIndices / 3;
         if (error.type != UFBX_ERROR_NONE) {
             // Maybe print some text like:
             // printf("Failed to generate index buffer: %s\n", error.description);
@@ -4684,6 +4695,11 @@ static size_t LoadFBXPartMesh(Mesh* outMesh, int* outMaterial,
                 RL_FREE(outMesh->vertices);
                 RL_FREE(outMesh->normals);
                 RL_FREE(outMesh->texcoords);
+
+                RL_FREE(outMesh->animVertices);
+                RL_FREE(outMesh->animNormals);
+                RL_FREE(outMesh->boneIds);
+                RL_FREE(outMesh->boneWeights);
                 return;
             }
 
@@ -4809,8 +4825,9 @@ static ufbx_scene *LoadFBXCommonLoad(const char* fileName)
         .allow_null_material = true,
         .allow_empty_faces = false,
         .allow_missing_vertex_position = false,
-        .strict = true,
+        // .strict = true,
         .generate_missing_normals = true,
+        .evaluate_skinning = true,
 
         .target_axes = {
             .right = UFBX_COORDINATE_AXIS_POSITIVE_X,
@@ -4852,7 +4869,7 @@ static Model LoadFBX(const char *fileName)
 
         rayMeshNum += fbxSameMesh;
         if (rayMeshNum > model.meshCount)
-            printf("We generate too much");
+            break; // We generated more then we should have ? Should not happen
     }
     // assert model.meshCount == rayMeshNum otherwise we allocated too much
     model.meshCount = rayMeshNum;
