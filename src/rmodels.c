@@ -4504,9 +4504,8 @@ static size_t LoadFBXPartMesh(Mesh* outMesh, int* outMaterial,
     // `ufbx_node*` instances eg. `ufbx_mesh.instances`.
 
     // Create the vertex buffers
-    size_t num_blend_shapes = 0;
+    // size_t num_blend_shapes = 0;
     // ufbx_blend_channel* blend_channels[MAX_BLEND_SHAPES];
-    size_t num_bones = 0;
     ufbx_skin_deformer* skin = NULL;
 
     // We will only use one deformer
@@ -4532,9 +4531,15 @@ static size_t LoadFBXPartMesh(Mesh* outMesh, int* outMaterial,
                     ufbx_skin_weight weight = skin->weights.data[vertexWeights.weight_begin + wi];
 
                     // Since we only support a fixed amount of bones up to `MAX_BONES` and we take the
-                    // first N ones we need to ignore weights with too high `cluster_index`.
-                    if (weight.cluster_index < UINT8_MAX) {
-                        skinVert->boneIndex[wi] = (uint8_t)weight.cluster_index;
+                    // first N up to 4 bones.
+                    // We need to ignore weights with too high `cluster_index`.
+                    if (weight.cluster_index < skin->clusters.count) // Should always be in range
+                    {
+                        // could fail -> uint32_t into uint8_t
+                        const uint8_t pos = (uint8_t)skin->clusters.data[weight.cluster_index]
+                            ->bone_node->typed_id;
+
+                        skinVert->boneIndex[wi] = pos;
                         skinVert->boneWeight[wi] = weight.weight;
                         weightSum += weight.weight;
                     }
@@ -4753,18 +4758,6 @@ static size_t LoadFBXPartMesh(Mesh* outMesh, int* outMaterial,
                     memcpy(outBoneIds, skinVert->boneIndex, sizeof(uint8_t) * 4);
                     memcpy(outBoneWeight, skinVert->boneWeight, sizeof(float) * 4);
 
-                    /*
-                    if (boneWeightSum < 1.0f)
-                    {
-                        // We can not fully pass on responsibility to bones,
-                        // the parent node still needs a slot
-
-                        outBoneIds[3] = (unsigned char)node->typed_id;
-                        outBoneWeight[3] = 1.0f - 
-                            (outBoneWeight[0] + outBoneWeight[1] + outBoneWeight[2]);
-                    }
-                    else if (boneWeightSum > 1.0f) 
-                    */
                     {
                         // try to normalize
                         outBoneWeight[0] /= boneWeightSum;
