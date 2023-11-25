@@ -2016,109 +2016,177 @@ ModelAnimation *LoadModelAnimations(const char *fileName, int *animCount)
     return animations;
 }
 
+const Matrix* UpdateModelAnimation_GenerateTransformationMatrixs(
+    const Model *model, const int meshNr, const ModelAnimation *anim, const int frame)
+{
+    static Matrix* Transforms = NULL;
+    static TransformsAlloc = 0;
+
+    if (TransformsAlloc < anim->boneCount)
+    {
+        Transforms = RL_REALLOC(Transforms, sizeof(Matrix) * anim->boneCount);
+        TransformsAlloc = anim->boneCount;
+
+        if (Transforms == NULL)
+        {
+            TRACELOG(LOG_WARNING, "MODEL: UpdateModelAnimation(): OutOfMemory", meshNr);
+            TransformsAlloc = 0;
+            return NULL;
+        }
+    }
+
+    const Mesh* mesh = model->meshes + meshNr;
+    for (int boneId = 0; boneId < anim->boneCount; ++boneId)
+    {
+        //int boneIdParent = model.bones[boneId].parent;
+        const Vector3 inTranslation = model->bindPose[boneId].translation;
+        const Quaternion inRotation = model->bindPose[boneId].rotation;
+        const Vector3 inScale = model->bindPose[boneId].scale;
+
+        const Vector3 outTranslation = anim->framePoses[frame][boneId].translation;
+        const Quaternion outRotation = anim->framePoses[frame][boneId].rotation;
+        const Vector3 outScale = anim->framePoses[frame][boneId].scale;
+
+        const Matrix inTranslationMat = MatrixTranslate(
+            -inTranslation.x,
+            -inTranslation.y,
+            -inTranslation.z);
+
+        const Vector3 scale = {
+            outScale.x / inScale.x,
+            outScale.y / inScale.y,
+            outScale.z / inScale.z
+        };
+        const Matrix scaleMat = MatrixScale(scale.x, scale.y, scale.z);
+        const Matrix rotationMatrix = QuaternionToMatrix(
+            QuaternionMultiply(outRotation, QuaternionInvert(inRotation)));
+        const Matrix outTranslationMat = MatrixTranslate(
+            outTranslation.x,
+            outTranslation.y,
+            outTranslation.z);
+        Transforms[boneId] = MatrixMultiply(inTranslationMat, MatrixMultiply(scaleMat, MatrixMultiply(rotationMatrix, outTranslationMat)));
+    }
+
+    for (int boneId = 0; boneId < anim->boneCount; ++boneId)
+    {
+        const int parentId = model->bones[boneId].parent;
+        if (parentId >= boneId)
+        {
+            if (parentId == boneId)
+            {
+                TRACELOG(LOG_WARNING, "MODEL: UpdateModelAnimation(): Bones self parent", meshNr);
+            }
+            else
+            {
+                TRACELOG(LOG_WARNING, "MODEL: UpdateModelAnimation(): Bones tree not monotonious growing correct", meshNr);
+            }
+            continue;
+        }
+
+        if (parentId < 0) continue; // Root Node
+
+        Transforms[boneId] = MatrixMultiply(Transforms[boneId], Transforms[parentId]);
+    }
+
+    return Transforms;
+}
+
 // Update model animated vertex data (positions and normals) for a given frame
 // NOTE: Updated data is uploaded to GPU
 void UpdateModelAnimation(Model model, ModelAnimation anim, int frame)
 {
-    if ((anim.frameCount > 0) && (anim.bones != NULL) && (anim.framePoses != NULL))
+    if (anim.frameCount <= 0 ||
+        anim.bones == NULL ||
+        anim.framePoses == NULL) return;
+    
+    if (frame >= anim.frameCount)
+        frame = frame % anim.frameCount;
+
+    for (int meshNr = 0; meshNr < model.meshCount; meshNr++)
     {
-        if (frame >= anim.frameCount) frame = frame%anim.frameCount;
-
-        for (int m = 0; m < model.meshCount; m++)
+        const Mesh* mesh = model.meshes + meshNr;
+        if (mesh == NULL || mesh->boneIds == NULL || mesh->boneWeights == NULL)
         {
-            Mesh mesh = model.meshes[m];
+            TRACELOG(LOG_WARNING, "MODEL: UpdateModelAnimation(): Mesh %i has no connection to bones", meshNr);
+            continue;
+        }
+        const Matrix* matrixs = UpdateModelAnimation_GenerateTransformationMatrixs(&model, meshNr, &anim, frame);
 
-            if (mesh.boneIds == NULL || mesh.boneWeights == NULL)
+        bool updated = false;           // Flag to check when anim vertex information is updated
+
+        int boneCounter = 0;
+        const int vValues = mesh->vertexCount*3;
+        for (int vCounter = 0; vCounter < vValues; vCounter += 3)
+        {
+            mesh->animVertices[vCounter] = 0.0f;
+            mesh->animVertices[vCounter + 1] = 0.0f;
+            mesh->animVertices[vCounter + 2] = 0.0f;
+
+            if (mesh->animNormals != NULL)
             {
-                TRACELOG(LOG_WARNING, "MODEL: UpdateModelAnimation(): Mesh %i has no connection to bones", m);
-                continue;
+                mesh->animNormals[vCounter] = 0.0f;
+                mesh->animNormals[vCounter + 1] = 0.0f;
+                mesh->animNormals[vCounter + 2] = 0.0f;
             }
 
-            bool updated = false;           // Flag to check when anim vertex information is updated
-            Vector3 animVertex = { 0 };
-            Vector3 animNormal = { 0 };
-
-            Vector3 inTranslation = { 0 };
-            Quaternion inRotation = { 0 };
-            Vector3 inScale = { 0 };
-
-            Vector3 outTranslation = { 0 };
-            Quaternion outRotation = { 0 };
-            Vector3 outScale = { 0 };
-
-            int boneId = 0;
-            int boneCounter = 0;
-            float boneWeight = 0.0;
-
-            const int vValues = mesh.vertexCount*3;
-            for (int vCounter = 0; vCounter < vValues; vCounter += 3)
+            // Iterates over 4 bones per vertex
+            for (int j = 0; j < 4; j++, boneCounter++)
             {
-                mesh.animVertices[vCounter] = 0;
-                mesh.animVertices[vCounter + 1] = 0;
-                mesh.animVertices[vCounter + 2] = 0;
+                const float boneWeight = mesh->boneWeights[boneCounter];
+                // Early stop when no transformation will be applied
+                if (boneWeight == 0.0f) continue;
 
-                if (mesh.animNormals != NULL)
+                const int boneId = mesh->boneIds[boneCounter];
+                if (boneId >= anim.boneCount)
                 {
-                    mesh.animNormals[vCounter] = 0;
-                    mesh.animNormals[vCounter + 1] = 0;
-                    mesh.animNormals[vCounter + 2] = 0;
+                    TRACELOG(LOG_WARNING, "MODEL_ANIMATION: Bone out of bounds, abort.");
+                    return;
                 }
 
-                // Iterates over 4 bones per vertex
-                for (int j = 0; j < 4; j++, boneCounter++)
+                // Vertices processing
+                // NOTE: We use meshes.vertices (default vertex position) to calculate meshes.animVertices (animated vertex position)
+                Vector3 animVertex = (Vector3){
+                    mesh->vertices[vCounter],
+                    mesh->vertices[vCounter + 1],
+                    mesh->vertices[vCounter + 2]
+                };
+                animVertex = Vector3Transform(animVertex, matrixs[boneId]);
+                mesh->animVertices[vCounter] += animVertex.x*boneWeight;
+                mesh->animVertices[vCounter + 1] += animVertex.y*boneWeight;
+                mesh->animVertices[vCounter + 2] += animVertex.z*boneWeight;
+                updated = true;
+
+                // Normals processing
+                // NOTE: We use meshes.baseNormals (default normal) to calculate meshes.normals (animated normals)
+                if (mesh->normals != NULL)
                 {
-                    boneWeight = mesh.boneWeights[boneCounter];
-
-                    // Early stop when no transformation will be applied
-                    if (boneWeight == 0.0f) continue;
-
-                    boneId = mesh.boneIds[boneCounter];
-                    //int boneIdParent = model.bones[boneId].parent;
-                    inTranslation = model.bindPose[boneId].translation;
-                    inRotation = model.bindPose[boneId].rotation;
-                    inScale = model.bindPose[boneId].scale;
-                    outTranslation = anim.framePoses[frame][boneId].translation;
-                    outRotation = anim.framePoses[frame][boneId].rotation;
-                    outScale = anim.framePoses[frame][boneId].scale;
-                    const Vector3 scale = {
-                        outScale.x / inScale.x,
-                        outScale.y / inScale.y,
-                        outScale.z / inScale.z
-                    };
-
-                    // Vertices processing
-                    // NOTE: We use meshes.vertices (default vertex position) to calculate meshes.animVertices (animated vertex position)
-                    animVertex = (Vector3){ mesh.vertices[vCounter], mesh.vertices[vCounter + 1], mesh.vertices[vCounter + 2] };
-                    animVertex = Vector3Subtract(animVertex, inTranslation);
-                    animVertex = Vector3Multiply(animVertex, scale);
-                    animVertex = Vector3RotateByQuaternion(animVertex, QuaternionMultiply(outRotation, QuaternionInvert(inRotation)));
-                    animVertex = Vector3Add(animVertex, outTranslation);
-                    //animVertex = Vector3Transform(animVertex, model.transform);
-                    mesh.animVertices[vCounter] += animVertex.x*boneWeight;
-                    mesh.animVertices[vCounter + 1] += animVertex.y*boneWeight;
-                    mesh.animVertices[vCounter + 2] += animVertex.z*boneWeight;
-                    updated = true;
-
-                    // Normals processing
-                    // NOTE: We use meshes.baseNormals (default normal) to calculate meshes.normals (animated normals)
-                    if (mesh.normals != NULL)
-                    {
-                        animNormal = (Vector3){ mesh.normals[vCounter], mesh.normals[vCounter + 1], mesh.normals[vCounter + 2] };
-                        animNormal = Vector3RotateByQuaternion(animNormal, QuaternionMultiply(outRotation, QuaternionInvert(inRotation)));
-                        mesh.animNormals[vCounter] += animNormal.x*boneWeight;
-                        mesh.animNormals[vCounter + 1] += animNormal.y*boneWeight;
-                        mesh.animNormals[vCounter + 2] += animNormal.z*boneWeight;
-                    }
+                    Vector3 animNormal = (Vector3){
+                        mesh->normals[vCounter],
+                        mesh->normals[vCounter + 1],
+                        mesh->normals[vCounter + 2] };
+                    const Quaternion quat = QuaternionFromMatrix(matrixs[boneId]);
+                    animNormal = Vector3RotateByQuaternion(animNormal, quat);
+                    mesh->animNormals[vCounter] += animNormal.x*boneWeight;
+                    mesh->animNormals[vCounter + 1] += animNormal.y*boneWeight;
+                    mesh->animNormals[vCounter + 2] += animNormal.z*boneWeight;
                 }
             }
+        }
 
-            // Upload new vertex data to GPU for model drawing
-            // NOTE: Only update data when values changed
-            if (updated)
-            {
-                rlUpdateVertexBuffer(mesh.vboId[0], mesh.animVertices, mesh.vertexCount*3*sizeof(float), 0); // Update vertex position
-                rlUpdateVertexBuffer(mesh.vboId[2], mesh.animNormals, mesh.vertexCount*3*sizeof(float), 0);  // Update vertex normals
-            }
+        // Upload new vertex data to GPU for model drawing
+        // NOTE: Only update data when values changed
+        if (updated)
+        {
+            rlUpdateVertexBuffer(
+                mesh->vboId[0],
+                mesh->animVertices,
+                mesh->vertexCount*3*sizeof(float),
+                0); // Update vertex position
+            rlUpdateVertexBuffer(
+                mesh->vboId[2],
+                mesh->animNormals,
+                mesh->vertexCount*3*sizeof(float),
+                0);  // Update vertex normals
         }
     }
 }
@@ -4536,8 +4604,12 @@ static size_t LoadFBXPartMesh(Mesh* outMesh, int* outMaterial,
                     if (weight.cluster_index < skin->clusters.count) // Should always be in range
                     {
                         // could fail -> uint32_t into uint8_t
-                        const uint8_t pos = (uint8_t)skin->clusters.data[weight.cluster_index]
+                        uint8_t pos = (uint8_t)skin->clusters.data[weight.cluster_index]
                             ->bone_node->typed_id;
+                        if (skin->clusters.data[weight.cluster_index] > UINT8_MAX)
+                        {
+                            TRACELOG(LOG_WARNING, "MODEL: Bone out of bounds. Animation might fail.");
+                        }
 
                         skinVert->boneIndex[wi] = pos;
                         skinVert->boneWeight[wi] = weight.weight;
@@ -4649,6 +4721,7 @@ static size_t LoadFBXPartMesh(Mesh* outMesh, int* outMaterial,
             continue;
         }
 
+        *outMaterial = -1;
         for (size_t instId = 0; instId < inMesh->instances.count; ++instId)
         {
             const ufbx_node* node = inMesh->instances.data[instId];
@@ -5124,18 +5197,18 @@ static Model LoadIQM(const char *fileName)
     //fread(tri, sizeof(IQMTriangle), iqmHeader->num_triangles, iqmFile);
     memcpy(tri, fileDataPtr + iqmHeader->ofs_triangles, iqmHeader->num_triangles*sizeof(IQMTriangle));
 
-    for (int m = 0; m < model.meshCount; m++)
+    for (int meshNr = 0; meshNr < model.meshCount; meshNr++)
     {
         int tcounter = 0;
 
-        for (unsigned int i = imesh[m].first_triangle; i < (imesh[m].first_triangle + imesh[m].num_triangles); i++)
+        for (unsigned int i = imesh[meshNr].first_triangle; i < (imesh[meshNr].first_triangle + imesh[meshNr].num_triangles); i++)
         {
             // IQM triangles indexes are stored in counter-clockwise, but raylib processes the index in linear order,
             // expecting they point to the counter-clockwise vertex triangle, so we need to reverse triangle indexes
             // NOTE: raylib renders vertex data in counter-clockwise order (standard convention) by default
-            model.meshes[m].indices[tcounter + 2] = tri[i].vertex[0] - imesh[m].first_vertex;
-            model.meshes[m].indices[tcounter + 1] = tri[i].vertex[1] - imesh[m].first_vertex;
-            model.meshes[m].indices[tcounter] = tri[i].vertex[2] - imesh[m].first_vertex;
+            model.meshes[meshNr].indices[tcounter + 2] = tri[i].vertex[0] - imesh[meshNr].first_vertex;
+            model.meshes[meshNr].indices[tcounter + 1] = tri[i].vertex[1] - imesh[meshNr].first_vertex;
+            model.meshes[meshNr].indices[tcounter] = tri[i].vertex[2] - imesh[meshNr].first_vertex;
             tcounter += 3;
         }
     }
@@ -5157,13 +5230,13 @@ static Model LoadIQM(const char *fileName)
                 //fread(vertex, iqmHeader->num_vertexes*3*sizeof(float), 1, iqmFile);
                 memcpy(vertex, fileDataPtr + va[i].offset, iqmHeader->num_vertexes*3*sizeof(float));
 
-                for (unsigned int m = 0; m < iqmHeader->num_meshes; m++)
+                for (unsigned int meshNr = 0; meshNr < iqmHeader->num_meshes; meshNr++)
                 {
                     int vCounter = 0;
-                    for (unsigned int i = imesh[m].first_vertex*3; i < (imesh[m].first_vertex + imesh[m].num_vertexes)*3; i++)
+                    for (unsigned int i = imesh[meshNr].first_vertex*3; i < (imesh[meshNr].first_vertex + imesh[meshNr].num_vertexes)*3; i++)
                     {
-                        model.meshes[m].vertices[vCounter] = vertex[i];
-                        model.meshes[m].animVertices[vCounter] = vertex[i];
+                        model.meshes[meshNr].vertices[vCounter] = vertex[i];
+                        model.meshes[meshNr].animVertices[vCounter] = vertex[i];
                         vCounter++;
                     }
                 }
@@ -5175,13 +5248,13 @@ static Model LoadIQM(const char *fileName)
                 //fread(normal, iqmHeader->num_vertexes*3*sizeof(float), 1, iqmFile);
                 memcpy(normal, fileDataPtr + va[i].offset, iqmHeader->num_vertexes*3*sizeof(float));
 
-                for (unsigned int m = 0; m < iqmHeader->num_meshes; m++)
+                for (unsigned int meshNr = 0; meshNr < iqmHeader->num_meshes; meshNr++)
                 {
                     int vCounter = 0;
-                    for (unsigned int i = imesh[m].first_vertex*3; i < (imesh[m].first_vertex + imesh[m].num_vertexes)*3; i++)
+                    for (unsigned int i = imesh[meshNr].first_vertex*3; i < (imesh[meshNr].first_vertex + imesh[meshNr].num_vertexes)*3; i++)
                     {
-                        model.meshes[m].normals[vCounter] = normal[i];
-                        model.meshes[m].animNormals[vCounter] = normal[i];
+                        model.meshes[meshNr].normals[vCounter] = normal[i];
+                        model.meshes[meshNr].animNormals[vCounter] = normal[i];
                         vCounter++;
                     }
                 }
@@ -5193,12 +5266,12 @@ static Model LoadIQM(const char *fileName)
                 //fread(text, iqmHeader->num_vertexes*2*sizeof(float), 1, iqmFile);
                 memcpy(text, fileDataPtr + va[i].offset, iqmHeader->num_vertexes*2*sizeof(float));
 
-                for (unsigned int m = 0; m < iqmHeader->num_meshes; m++)
+                for (unsigned int meshNr = 0; meshNr < iqmHeader->num_meshes; meshNr++)
                 {
                     int vCounter = 0;
-                    for (unsigned int i = imesh[m].first_vertex*2; i < (imesh[m].first_vertex + imesh[m].num_vertexes)*2; i++)
+                    for (unsigned int i = imesh[meshNr].first_vertex*2; i < (imesh[meshNr].first_vertex + imesh[meshNr].num_vertexes)*2; i++)
                     {
-                        model.meshes[m].texcoords[vCounter] = text[i];
+                        model.meshes[meshNr].texcoords[vCounter] = text[i];
                         vCounter++;
                     }
                 }
@@ -5210,12 +5283,12 @@ static Model LoadIQM(const char *fileName)
                 //fread(blendi, iqmHeader->num_vertexes*4*sizeof(char), 1, iqmFile);
                 memcpy(blendi, fileDataPtr + va[i].offset, iqmHeader->num_vertexes*4*sizeof(char));
 
-                for (unsigned int m = 0; m < iqmHeader->num_meshes; m++)
+                for (unsigned int meshNr = 0; meshNr < iqmHeader->num_meshes; meshNr++)
                 {
                     int boneCounter = 0;
-                    for (unsigned int i = imesh[m].first_vertex*4; i < (imesh[m].first_vertex + imesh[m].num_vertexes)*4; i++)
+                    for (unsigned int i = imesh[meshNr].first_vertex*4; i < (imesh[meshNr].first_vertex + imesh[meshNr].num_vertexes)*4; i++)
                     {
-                        model.meshes[m].boneIds[boneCounter] = blendi[i];
+                        model.meshes[meshNr].boneIds[boneCounter] = blendi[i];
                         boneCounter++;
                     }
                 }
@@ -5227,12 +5300,12 @@ static Model LoadIQM(const char *fileName)
                 //fread(blendw, iqmHeader->num_vertexes*4*sizeof(unsigned char), 1, iqmFile);
                 memcpy(blendw, fileDataPtr + va[i].offset, iqmHeader->num_vertexes*4*sizeof(unsigned char));
 
-                for (unsigned int m = 0; m < iqmHeader->num_meshes; m++)
+                for (unsigned int meshNr = 0; meshNr < iqmHeader->num_meshes; meshNr++)
                 {
                     int boneCounter = 0;
-                    for (unsigned int i = imesh[m].first_vertex*4; i < (imesh[m].first_vertex + imesh[m].num_vertexes)*4; i++)
+                    for (unsigned int i = imesh[meshNr].first_vertex*4; i < (imesh[meshNr].first_vertex + imesh[meshNr].num_vertexes)*4; i++)
                     {
-                        model.meshes[m].boneWeights[boneCounter] = blendw[i]/255.0f;
+                        model.meshes[meshNr].boneWeights[boneCounter] = blendw[i]/255.0f;
                         boneCounter++;
                     }
                 }
@@ -5244,14 +5317,14 @@ static Model LoadIQM(const char *fileName)
                 //fread(blendw, iqmHeader->num_vertexes*4*sizeof(unsigned char), 1, iqmFile);
                 memcpy(color, fileDataPtr + va[i].offset, iqmHeader->num_vertexes*4*sizeof(unsigned char));
 
-                for (unsigned int m = 0; m < iqmHeader->num_meshes; m++)
+                for (unsigned int meshNr = 0; meshNr < iqmHeader->num_meshes; meshNr++)
                 {
-                    model.meshes[m].colors = RL_CALLOC(model.meshes[m].vertexCount*4, sizeof(unsigned char));
+                    model.meshes[meshNr].colors = RL_CALLOC(model.meshes[meshNr].vertexCount*4, sizeof(unsigned char));
 
                     int vCounter = 0;
-                    for (unsigned int i = imesh[m].first_vertex*4; i < (imesh[m].first_vertex + imesh[m].num_vertexes)*4; i++)
+                    for (unsigned int i = imesh[meshNr].first_vertex*4; i < (imesh[meshNr].first_vertex + imesh[meshNr].num_vertexes)*4; i++)
                     {
-                        model.meshes[m].colors[vCounter] = color[i];
+                        model.meshes[meshNr].colors[vCounter] = color[i];
                         vCounter++;
                     }
                 }
@@ -5979,15 +6052,15 @@ static Model LoadGLTF(const char *fileName)
 
                 // Assign to the primitive mesh the corresponding material index
                 // NOTE: If no material defined, mesh uses the already assigned default material (index: 0)
-                for (unsigned int m = 0; m < data->materials_count; m++)
+                for (unsigned int meshNr = 0; meshNr < data->materials_count; meshNr++)
                 {
                     // The primitive actually keeps the pointer to the corresponding material,
                     // raylib instead assigns to the mesh the by its index, as loaded in model.materials array
                     // To get the index, we check if material pointers match, and we assign the corresponding index,
                     // skipping index 0, the default material
-                    if (&data->materials[m] == data->meshes[i].primitives[p].material)
+                    if (&data->materials[meshNr] == data->meshes[i].primitives[p].material)
                     {
-                        model.meshMaterial[meshIndex] = m + 1;
+                        model.meshMaterial[meshIndex] = meshNr + 1;
                         break;
                     }
                 }
